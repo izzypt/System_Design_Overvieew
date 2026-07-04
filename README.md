@@ -5,6 +5,8 @@
 
 2 - [OSI Model](#osi-model)
 
+3 - [TCP/IP Model](#tcp/ip-model)
+
 
 <a name="cap-theorem-section"><a/>
 # 1 - CAP Theorem
@@ -99,3 +101,54 @@ Imagine writing a letter (Data) to a friend:
 3. **Layer 3 (Network):** You place each page into an envelope and write your friend's global mailing address (IP Address) on them.
 4. **Layer 2 (Data Link):** The post office looks at the zip code and puts the envelopes onto a specific local delivery truck (MAC Address / Switch).
 5. **Layer 1 (Physical):** The truck physically drives down the asphalt road (Cables/Wires) to deliver the letters.
+
+
+<a name="tcp/ip-model"><a/>
+# 3 - TCP/IP Model
+
+While the 7-layer **OSI model** is the gold standard for teaching networking concepts, the **TCP/IP model** is what the internet actually runs on.
+
+The easiest way to think about it is that the OSI model is a **theoretical** framework designed by a committee, whereas the TCP/IP model is a **practical** framework designed by engineers to get computers talking immediately.
+
+---
+
+## The Core Difference: Layer Merging
+
+The TCP/IP model combines several of the OSI layers because, in practice, software developers usually handle them all together. It condenses the 7 layers down into **4 layers**.
+
+| OSI Layer | TCP/IP Layer | What lives there? |
+| --- | --- | --- |
+| **7. Application**<br>
+
+<br>**6. Presentation**<br>
+
+<br>**5. Session** | **4. Application** | Everything the user interacts with (HTTP, FTP, SMTP, DNS, encryption/TLS, and session management). |
+| **4. Transport** | **3. Transport** | Controls host-to-host data flow (TCP, UDP). |
+| **3. Network** | **2. Internet** | Routes packets across different networks globally (IP addresses, ICMP). |
+| **2. Data Link**<br>
+
+<br>**1. Physical** | **1. Network Access** *(or Link Layer)* | Handles physical hardware, local wiring, and local device jumping (Ethernet, Wi-Fi, MAC addresses). |
+
+---
+
+## Structural & Philosophical Differences
+
+### 1. Theory vs. Practice
+
+* **OSI (Open Systems Interconnection):** Created by the International Organization for Standardization (ISO) in 1984. It was designed *before* the protocols were actually written. Because it was built by a committee, it is highly structured and strict, but sometimes clunky.
+* **TCP/IP (Transmission Control Protocol / Internet Protocol):** Developed by the US Department of Defense (DARPA) in the 1970s. It was built around existing protocols that were already working in the real world.
+
+### 2. Loose vs. Rigid Boundaries
+
+* **In OSI,** the boundaries are strict. An application developer *cannot* touch Layer 5 or 6 directly; they must pass data down through the rigid chain.
+* **In TCP/IP,** the Application layer is a catch-all. If you are writing a web application, your code handles the data (OSI Layer 7), handles the JSON serialization (OSI Layer 6), and tracks the login session (OSI Layer 5) all inside the same program.
+
+### 3. Connection Philosophy
+
+* **OSI model** supports both connectionless and connection-oriented communication at the Network layer.
+* **TCP/IP model** assumes a connectionless Network layer (IP packets are just thrown into the internet, and routers try their best to deliver them). It shifts the responsibility of a reliable connection entirely up to the Transport layer (TCP).
+
+## Which one should you use?
+
+* Use the **OSI model** when you are **troubleshooting or interviewing**. (e.g., *"We have a Layer 3 issue"* means check the router or IP configurations; *"We have a Layer 1 issue"* means check if the cable is plugged in).
+* Use the **TCP/IP model** when you are **building software or configuring production servers**, as it maps directly to how the actual protocols and operating system kernels interact.
