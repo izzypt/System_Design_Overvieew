@@ -18,6 +18,7 @@ Every read receives the most recent write or an error. Imagine updating your pro
 
 - Availability (A): Every request receives a response, without guarantee that it contains the most recent write. Every non-failing node returns a non-error response, without the guarantee that it contains the most recent write. The system is always up and responsive, even if it occasionally serves stale data.
 
-- Partition Tolerance (P): The system continues to operate despite an arbitrary number of messages being dropped or delayed by the network between nodes.
+- Partition Tolerance (P): The system continues to operate despite network partitions.
+The system continues to operate despite an arbitrary number of messages being dropped or delayed by the network between nodes.
 
 <img width="800" height="487" alt="image" src="https://github.com/user-attachments/assets/76ab1927-d556-41fd-8e26-8842661de877" />
