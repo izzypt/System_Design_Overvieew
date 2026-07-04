@@ -7,6 +7,8 @@
 
 3 - [TCP/IP Model](#tcp/ip-model)
 
+4 - [ACID and SQL/NoSQL](#acid-sql-nosql)
+
 
 <a name="cap-theorem-section"><a/>
 # 1 - CAP Theorem
@@ -209,3 +211,63 @@ The TCP/IP model combines several of the OSI layers because, in practice, softwa
 
 * Use the **OSI model** when you are **troubleshooting or interviewing**. (e.g., *"We have a Layer 3 issue"* means check the router or IP configurations; *"We have a Layer 1 issue"* means check if the cable is plugged in).
 * Use the **TCP/IP model** when you are **building software or configuring production servers**, as it maps directly to how the actual protocols and operating system kernels interact.
+
+
+<a name="acid-sql-nosql"><a/>
+# 4 - ACID and SQL/NoSQL
+
+Here is the complete breakdown of how databases manage reliability (ACID), how they are built (SQL vs. NoSQL), and how to choose the right one for your project.
+
+---
+
+## Part 1: What is ACID?
+
+**ACID** is a set of four safety properties that guarantee database transactions are processed reliably. If a database is ACID-compliant, you can trust that your data won't get corrupted, even if the power goes out mid-transaction.
+
+* **Atomicity ("All or Nothing"):** A transaction often requires multiple steps. Atomicity guarantees that either *all* steps succeed, or the entire transaction fails and rolls back like nothing happened.
+* *Example:* If you transfer $100 from Account A to Account B, the money must be debited from A *and* credited to B. If the server crashes halfway through, the database rolls back so Account A doesn't lose $100 into thin air.
+
+
+* **Consistency ("Follow the Rules"):** A transaction can only take the database from one valid state to another, maintaining all schema rules, constraints, and data types.
+* *Example:* If a database column states that a user balance cannot be negative, any transaction that would result in a negative balance is rejected.
+
+
+* **Isolation ("No Peeking"):** If multiple users are making changes at the exact same time, their transactions are isolated from one another. The database handles them in a way that makes them feel sequential.
+* *Example:* If two people buy the very last concert ticket at the exact same millisecond, the database isolates the transactions so only one succeeds, preventing double-selling.
+
+
+* **Durability ("Built to Last"):** Once a transaction is committed, it is permanently saved in non-volatile memory (like a hard drive). Even if the entire data center loses power a millisecond later, the data is safe.
+
+---
+
+## Part 2: SQL vs. NoSQL (The Core Differences)
+
+The easiest way to understand the difference is how they organize data: **SQL is like an Excel Spreadsheet; NoSQL is like a folder full of JSON text files.**
+
+| Feature | SQL (Relational) | NoSQL (Non-Relational) |
+| --- | --- | --- |
+| **Data Model** | Strict tables with fixed rows and columns. | Flexible (JSON documents, Key-Value pairs, Graphs, Column-families). |
+| **Schema** | **Static.** You must define your tables and columns *before* adding data. Altering a schema later is heavy work. | **Dynamic.** Every row (document) can have completely different fields. You can add new fields on the fly. |
+| **Scaling** | **Vertical.** You scale by buying a bigger, faster server (more CPU/RAM). | **Horizontal.** You scale by adding *more* cheap servers to a cluster (sharding data across them). |
+| **ACID Support** | Native, out-of-the-box ACID compliance. | Historically prioritized performance over ACID (relies on *Eventual Consistency*), though many modern NoSQL DBs offer limited ACID support now. |
+
+---
+
+## Part 3: Where Each One Shines
+
+### Choose SQL if...
+
+You have highly structured data where relationships matter immensely, and data integrity is non-negotiable.
+
+* **Fintech & E-Commerce:** Apps handling money, ledgers, or inventories where a single missing row or calculation error ruins the business.
+* **Complex Analytical Queries:** Systems where you need to join dozens of tables together to generate deeply specific reports (e.g., *"Show me all users who bought product X in July who live in Lisbon"*).
+* **Popular choices:** PostgreSQL, MySQL, SQLite, Microsoft SQL Server.
+
+### Choose NoSQL if...
+
+You are dealing with massive amounts of unstructured data, rapidly changing features, or need massive horizontal scale.
+
+* **Real-time Analytics & Logging:** Tracking millions of user clicks, IoT sensor data, or system logs where speed is critical and missing a single data point won't break the app.
+* **Content Management & Social Feeds:** User profiles where different users have entirely different attributes (e.g., one user has a LinkedIn link, another has a bio, another has nothing).
+* **Rapid Prototyping:** Startups changing their data structure every week without wanting to run complex database migrations.
+* **Popular choices:** MongoDB (Document), Redis (Key-Value), Neo4j (Graph), Cassandra (Wide-Column).
