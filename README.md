@@ -9,6 +9,8 @@
 
 4 - [ACID and SQL/NoSQL](#acid-sql-nosql)
 
+5 - [Communication in Real-Time - WebSockets](#websockets)
+
 
 <a name="cap-theorem-section"><a/>
 # 1 - CAP Theorem
@@ -267,7 +269,233 @@ You have highly structured data where relationships matter immensely, and data i
 
 You are dealing with massive amounts of unstructured data, rapidly changing features, or need massive horizontal scale.
 
+
 * **Real-time Analytics & Logging:** Tracking millions of user clicks, IoT sensor data, or system logs where speed is critical and missing a single data point won't break the app.
 * **Content Management & Social Feeds:** User profiles where different users have entirely different attributes (e.g., one user has a LinkedIn link, another has a bio, another has nothing).
 * **Rapid Prototyping:** Startups changing their data structure every week without wanting to run complex database migrations.
 * **Popular choices:** MongoDB (Document), Redis (Key-Value), Neo4j (Graph), Cassandra (Wide-Column).
+
+
+<a name="websockets"><a/>
+# 5 - Communication in Real-Time
+
+<img width="2235" height="3192" alt="image" src="https://github.com/user-attachments/assets/030d9af9-8b6f-4700-9a95-350f122c39cb" />
+
+## O problema que os WebSockets resolvem
+
+Antes dos WebSockets existirem, se quisesses dados em "tempo real" no browser tinhas duas más opções:
+
+- **Polling**: o cliente faz `GET /updates` a cada X segundos. Simples, mas desperdiça pedidos quando não há nada de novo, e introduz latência (na pior das hipóteses, esperas quase X segundos por uma atualização).
+- **Long polling**: o cliente faz um pedido HTTP que o servidor mantém aberto até ter algo para responder. Reduz o desperdício, mas cada resposta implica reabrir uma nova ligação logo a seguir, com todo o overhead de headers HTTP outra vez.
+
+Os WebSockets resolvem isto com uma ligação TCP persistente e bidirecional: depois de estabelecida, tanto o cliente como o servidor podem enviar mensagens a qualquer momento, sem reabrir nada.
+
+## O handshake: de HTTP para WebSocket
+
+Uma ligação WebSocket começa sempre como um pedido HTTP normal. O cliente pede um "upgrade" de protocolo:
+
+```
+GET /chat HTTP/1.1
+Host: exemplo.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+```
+
+Se o servidor aceitar, responde com `101 Switching Protocols` e a partir daí a ligação TCP deixa de falar HTTP e passa a falar o protocolo WebSocket:
+
+```
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+O `Sec-WebSocket-Accept` não é aleatório — é calculado a partir do `Sec-WebSocket-Key` do cliente, concatenado com um GUID fixo definido na RFC 6455, seguido de SHA-1 e Base64. Isto serve para confirmar que quem respondeu percebe mesmo o protocolo WebSocket (e não é, por exemplo, uma cache HTTP mal configurada a devolver uma resposta antiga). Em Python:
+
+```python
+import hashlib
+import base64
+
+WEBSOCKET_MAGIC_STRING = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+def compute_accept_key(client_key: str) -> str:
+    sha1 = hashlib.sha1((client_key + WEBSOCKET_MAGIC_STRING).encode())
+    return base64.b64encode(sha1.digest()).decode()
+
+compute_accept_key("dGhlIHNhbXBsZSBub25jZQ==")
+# 's3pPLMBiTxaQ9kYGzzhZRbK+xOo='
+```
+
+Na prática nunca vais implementar isto manualmente — bibliotecas como `websockets` ou frameworks como FastAPI tratam do handshake por ti. Mas perceber que é "só" um pedido HTTP com uma verificação criptográfica leve ajuda a entender por que é que os WebSockets funcionam através da maior parte de proxies e load balancers modernos (é literalmente HTTP até este ponto).
+
+## Anatomia de um frame
+
+Depois do handshake, os dados já não viajam como texto HTTP — viajam como **frames binários**. Cada frame tem, resumidamente:
+
+- **FIN bit**: indica se este é o último frame de uma mensagem (mensagens podem ser fragmentadas em vários frames).
+- **Opcode**: o tipo de frame — `0x1` texto, `0x2` binário, `0x8` close, `0x9` ping, `0xA` pong.
+- **MASK bit + masking key**: frames enviados pelo cliente têm de ser mascarados (XOR com uma chave de 4 bytes) por razões de segurança — evita que dados de cliente pareçam tráfego HTTP arbitrário a proxies mal configurados. O servidor nunca mascara.
+- **Payload length**: pode ser codificado em 7, 16 ou 64 bits, dependendo do tamanho.
+
+Para perceberes a mecânica, aqui está uma descodificação minimalista de um frame de texto não fragmentado, feita à mão sobre um socket raw (só para fins didáticos — nunca farias isto em produção):
+
+```python
+import struct
+
+def decode_frame(data: bytes) -> str:
+    b1, b2 = data[0], data[1]
+    opcode = b1 & 0x0F
+    masked = (b2 & 0x80) != 0
+    payload_len = b2 & 0x7F
+
+    offset = 2
+    if payload_len == 126:
+        payload_len = struct.unpack(">H", data[offset:offset+2])[0]
+        offset += 2
+    elif payload_len == 127:
+        payload_len = struct.unpack(">Q", data[offset:offset+8])[0]
+        offset += 8
+
+    if masked:
+        mask_key = data[offset:offset+4]
+        offset += 4
+        payload = data[offset:offset+payload_len]
+        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    else:
+        payload = data[offset:offset+payload_len]
+
+    return payload.decode("utf-8") if opcode == 0x1 else payload
+```
+
+Na prática usas sempre uma biblioteca para isto — o objetivo aqui é só desmistificar o que está a acontecer "por baixo" quando chamas `websocket.send("olá")`.
+
+## Um servidor WebSocket simples com Python
+
+A biblioteca [`websockets`](https://websockets.readthedocs.io/) é a forma mais direta de trabalhar com WebSockets em Python puro, sem framework:
+
+```python
+import asyncio
+import websockets
+
+async def echo(websocket):
+    async for message in websocket:
+        print(f"Recebido: {message}")
+        await websocket.send(f"Echo: {message}")
+
+async def main():
+    async with websockets.serve(echo, "localhost", 8765):
+        await asyncio.Future()  # corre para sempre
+
+asyncio.run(main())
+```
+
+E o cliente correspondente:
+
+```python
+import asyncio
+import websockets
+
+async def client():
+    async with websockets.connect("ws://localhost:8765") as ws:
+        await ws.send("olá servidor")
+        resposta = await ws.recv()
+        print(resposta)
+
+asyncio.run(client())
+```
+
+Repara que não há loop manual de "faz pedido, espera resposta, repete" — a ligação fica aberta e `send`/`recv` funcionam a qualquer momento, em qualquer direção.
+
+## Ping/Pong e fecho da ligação
+
+Ligações TCP podem morrer silenciosamente (um router desliga, o portátil vai para suspensão). O protocolo WebSocket define frames `ping` e `pong` como heartbeat: o servidor (ou cliente) envia um `ping` periodicamente e espera um `pong` de volta; se não chegar dentro de um timeout, considera a ligação morta e fecha-a.
+
+A biblioteca `websockets` faz isto automaticamente por defeito, mas é configurável:
+
+```python
+async with websockets.serve(
+    echo,
+    "localhost",
+    8765,
+    ping_interval=20,  # envia ping a cada 20s
+    ping_timeout=10,   # fecha se não houver pong em 10s
+):
+    ...
+```
+
+O fecho da ligação também é um handshake próprio: um lado envia um frame `close` (opcode `0x8`, opcionalmente com um código de razão), o outro responde com o seu próprio `close`, e só depois o socket TCP subjacente é fechado. Isto evita perder mensagens que já estavam "em trânsito" quando alguém decide desligar.
+
+## WebSockets num framework real: FastAPI
+
+No teu stack (FastAPI), o suporte a WebSockets é nativo via Starlette:
+
+```python
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+app = FastAPI()
+
+@app.websocket("/ws/chat/{room_id}")
+async def chat_endpoint(websocket: WebSocket, room_id: str):
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_text()
+            await websocket.send_text(f"[{room_id}] {data}")
+    except WebSocketDisconnect:
+        print(f"Cliente saiu da sala {room_id}")
+```
+
+`websocket.accept()` é onde o handshake HTTP → WS acontece de facto (podias inspecionar/validar headers antes de aceitar, por exemplo para autenticação). `receive_text()` e `send_text()` bloqueiam a corrotina até haver dados, sem polling.
+
+## O problema real: escalar para múltiplos processos
+
+Isto é o que normalmente apanha as pessoas de surpresa. Um único processo FastAPI/Uvicorn consegue manter, digamos, milhares de ligações WebSocket abertas em memória — mas assim que corres **múltiplos workers** (o normal em produção, com Gunicorn/Uvicorn `--workers 4` ou várias réplicas em Kubernetes), cada worker só conhece as ligações que ele próprio aceitou.
+
+Se o utilizador A está ligado ao worker 1 e o utilizador B ao worker 2, e A quer mandar uma mensagem a B, o worker 1 não tem forma de "alcançar" a ligação do worker 2 diretamente — precisas de um mecanismo de **pub/sub** partilhado entre processos. Redis é a escolha mais comum:
+
+```python
+import redis.asyncio as redis
+import asyncio
+from fastapi import FastAPI, WebSocket
+
+app = FastAPI()
+redis_client = redis.Redis(host="localhost", port=6379)
+
+@app.websocket("/ws/chat/{room_id}")
+async def chat_endpoint(websocket: WebSocket, room_id: str):
+    await websocket.accept()
+    pubsub = redis_client.pubsub()
+    await pubsub.subscribe(f"room:{room_id}")
+
+    async def reader():
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                await websocket.send_text(message["data"].decode())
+
+    reader_task = asyncio.create_task(reader())
+    try:
+        while True:
+            data = await websocket.receive_text()
+            # publica para TODOS os workers subscritos a esta sala
+            await redis_client.publish(f"room:{room_id}", data)
+    finally:
+        reader_task.cancel()
+        await pubsub.unsubscribe(f"room:{room_id}")
+```
+
+Cada worker que tem clientes ligados a uma sala subscreve o canal Redis correspondente. Quando qualquer worker recebe uma mensagem de um cliente, publica-a no Redis; todos os workers subscritos (incluindo os que têm os destinatários ligados) recebem-na e reenviam-na pelos seus próprios sockets. É o mesmo padrão que usarias com Django Channels (que usa exatamente Redis como "channel layer" por baixo).
+
+## Segurança e autenticação
+
+Alguns pontos que costumam ser negligenciados:
+
+- **`wss://` em produção**, sempre — é o equivalente a `https://` para WebSockets, com TLS. Sem isto, qualquer intermediário na rede lê e altera as mensagens em claro.
+- **Autenticação no handshake**, não depois: como o WebSocket não tem um conceito nativo de "headers por mensagem" como o HTTP, a autenticação normalmente é feita com um token JWT passado como query string (`wss://exemplo.com/ws?token=...`) ou via cookie de sessão já existente, validado em `websocket.accept()` — nunca confies em mensagens de autenticação enviadas *depois* de aceitar a ligação, porque nesse intervalo já aceitaste tráfego de alguém não autenticado.
+- **Validação de `Origin`**: por defeito, browsers não aplicam CORS a WebSockets da mesma forma que a `fetch()`. Se não validares o header `Origin` no handshake, qualquer site pode abrir um WebSocket para o teu servidor a partir do browser de um utilizador autenticado (um padrão análogo a CSRF).
+- **Rate limiting por ligação**: como a ligação fica aberta, um cliente malicioso pode enviar mensagens a um ritmo muito mais alto do que conseguiria com pedidos HTTP individuais — vale a pena limitar mensagens/segundo por ligação.
+
+## Quando (não) usar
+
+WebSockets valem a complexidade extra quando precisas de baixa latência **nos dois sentidos** e com frequência — chat, colaboração em tempo real, jogos, trading. Se só precisas que o servidor empurre atualizações ocasionais para o cliente (notificações, progresso de um job em background), Server-Sent Events costuma ser mais simples de implementar, operar e escalar, precisamente por correr sobre HTTP normal e não precisar de gestão de estado distribuído como o exemplo do Redis acima.
