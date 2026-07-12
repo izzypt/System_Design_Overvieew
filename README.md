@@ -508,7 +508,7 @@ WebSockets valem a complexidade extra quando precisas de baixa latência **nos d
 
 
 <a name="oddfeed"><a/>
-# Building a real-time odds feed: how to move prices from 300 bookmakers to a trading desk in milliseconds
+# Building a real-time odds feed
 
 Imagine you're asked to build the following product. Your company collects betting odds from more than 300 bookmakers and betting exchanges around the world. Your customers are hedge funds, market makers, and sportsbooks — people who trade on these prices. When Real Madrid scores in the 87th minute, the odds on every bookmaker in the world start moving within seconds, and your customers need to see those movements *as they happen*. Not in a minute. Not in ten seconds. In milliseconds, because whoever sees the price move first gets to act on it first.
 
