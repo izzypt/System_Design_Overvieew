@@ -1,5 +1,6 @@
 # System_Design_Overvieew
 
+# Concepts
 
 1 - [CAP Theorem](#cap-theorem-section)
 
@@ -10,6 +11,10 @@
 4 - [ACID and SQL/NoSQL](#acid-sql-nosql)
 
 5 - [Communication in Real-Time - WebSockets](#websockets)
+
+# Practical cases or blog posts
+
+- [Building Real time feed](#oddfeed)
 
 
 <a name="cap-theorem-section"><a/>
@@ -499,3 +504,447 @@ Alguns pontos que costumam ser negligenciados:
 ## Quando (não) usar
 
 WebSockets valem a complexidade extra quando precisas de baixa latência **nos dois sentidos** e com frequência — chat, colaboração em tempo real, jogos, trading. Se só precisas que o servidor empurre atualizações ocasionais para o cliente (notificações, progresso de um job em background), Server-Sent Events costuma ser mais simples de implementar, operar e escalar, precisamente por correr sobre HTTP normal e não precisar de gestão de estado distribuído como o exemplo do Redis acima.
+
+
+
+<a name="oddfeed"><a/>
+# Building Real time feed
+
+Imagine you're asked to build the following product. Your company collects betting odds from more than 300 bookmakers and betting exchanges around the world. Your customers are hedge funds, market makers, and sportsbooks — people who trade on these prices. When Real Madrid scores in the 87th minute, the odds on every bookmaker in the world start moving within seconds, and your customers need to see those movements *as they happen*. Not in a minute. Not in ten seconds. In milliseconds, because whoever sees the price move first gets to act on it first.
+
+That's the whole product: data goes in from 300 places, data goes out to hundreds of clients, and the clock is always ticking.
+
+It sounds simple when you say it in one sentence. It stops being simple the moment you start sketching it. This post walks through the problem the way you'd walk through it in a system design discussion: first understanding why the obvious approaches fail, then introducing the concepts you need one at a time, and finally assembling them into an architecture where every component earns its place.
+
+## Why the obvious approach doesn't work
+
+Let's start with the design every developer sketches first, because understanding why it breaks teaches you everything else.
+
+The naive version: build a REST API. Store the latest odds in a database. Clients call `GET /odds/real-madrid-vs-barcelona` whenever they want fresh prices.
+
+The first problem is a question: *how often do clients call it?* If a hedge fund polls every 5 seconds, they're up to 5 seconds behind the market — an eternity in trading. So they poll every 100 milliseconds instead. Now multiply: 500 clients × 10 requests per second × dozens of markets each. You're serving hundreds of thousands of requests per second, and the punchline is that **most of those requests return nothing new**. Odds on a quiet market might not change for minutes. You're burning enormous resources answering the question "did anything change?" with "no."
+
+Polling has a fundamental shape problem: the client is asking, but only the server *knows* when something changed. The communication is pointed the wrong way. What you actually want is for the server to stay quiet until something happens, and then *push* the update to everyone who cares, immediately.
+
+This is the first concept we need.
+
+## Concept 1: WebSockets, or how a server pushes
+
+Normal HTTP is request/response: the client asks, the server answers, the connection is done. The server has no way to spontaneously say something to a client — it can only ever *answer*.
+
+A **WebSocket** flips this. It starts life as a normal HTTP request with a special header that says "let's upgrade this connection." The server agrees, and from that moment the underlying TCP connection stays open — for minutes, hours, days. Both sides can now send messages to each other at any time, in either direction, with no new connection setup and no asking.
+
+For our odds feed, this changes the shape of everything. A client connects once, says "I'm interested in La Liga football and NBA basketball," and then just *listens*. When a price moves, the server pushes one small message down that already-open pipe. No polling, no wasted requests, no "did anything change?" — the client hears about changes precisely when they happen and never otherwise.
+
+# Building a real-time odds feed: how to move prices from 300 bookmakers to a trading desk in milliseconds
+
+Imagine you're asked to build the following product. Your company collects betting odds from more than 300 bookmakers and betting exchanges around the world. Your customers are hedge funds, market makers, and sportsbooks — people who trade on these prices. When Real Madrid scores in the 87th minute, the odds on every bookmaker in the world start moving within seconds, and your customers need to see those movements *as they happen*. Not in a minute. Not in ten seconds. In milliseconds, because whoever sees the price move first gets to act on it first.
+
+That's the whole product: data goes in from 300 places, data goes out to hundreds of clients, and the clock is always ticking.
+
+It sounds simple when you say it in one sentence. It stops being simple the moment you start sketching it. This post walks through the problem the way you'd walk through it in a system design discussion: first understanding why the obvious approaches fail, then introducing the concepts you need one at a time, and finally assembling them into an architecture where every component earns its place.
+
+## Why the obvious approach doesn't work
+
+Let's start with the design every developer sketches first, because understanding why it breaks teaches you everything else.
+
+The naive version: build a REST API. Store the latest odds in a database. Clients call `GET /odds/real-madrid-vs-barcelona` whenever they want fresh prices.
+
+The first problem is a question: *how often do clients call it?* If a hedge fund polls every 5 seconds, they're up to 5 seconds behind the market — an eternity in trading. So they poll every 100 milliseconds instead. Now multiply: 500 clients × 10 requests per second × dozens of markets each. You're serving hundreds of thousands of requests per second, and the punchline is that **most of those requests return nothing new**. Odds on a quiet market might not change for minutes. You're burning enormous resources answering the question "did anything change?" with "no."
+
+Polling has a fundamental shape problem: the client is asking, but only the server *knows* when something changed. The communication is pointed the wrong way. What you actually want is for the server to stay quiet until something happens, and then *push* the update to everyone who cares, immediately.
+
+This is the first concept we need.
+
+## Concept 1: WebSockets, or how a server pushes
+
+Normal HTTP is request/response: the client asks, the server answers, the connection is done. The server has no way to spontaneously say something to a client — it can only ever *answer*.
+
+A **WebSocket** flips this. It starts life as a normal HTTP request with a special header that says "let's upgrade this connection." The server agrees, and from that moment the underlying TCP connection stays open — for minutes, hours, days. Both sides can now send messages to each other at any time, in either direction, with no new connection setup and no asking.
+
+For our odds feed, this changes the shape of everything. A client connects once, says "I'm interested in La Liga football and NBA basketball," and then just *listens*. When a price moves, the server pushes one small message down that already-open pipe. No polling, no wasted requests, no "did anything change?" — the client hears about changes precisely when they happen and never otherwise.
+
+<svg width="680" viewBox="0 0 680 300" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" role="img" aria-label="Polling versus WebSocket push comparison">
+<defs><marker id="ar1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#73726c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="40" y="40" width="280" height="240" rx="12" fill="none" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4"/>
+<text x="180" y="66" text-anchor="middle" font-size="14" font-weight="500" fill="#3d3d3a">Polling</text>
+<rect x="70" y="84" width="220" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="180" y="102" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#444441">Client</text>
+<text x="180" y="120" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">Asks every 100 ms</text>
+<line x1="130" y1="140" x2="130" y2="198" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar1)"/>
+<line x1="230" y1="200" x2="230" y2="142" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar1)"/>
+<rect x="70" y="200" width="220" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="180" y="218" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#444441">Server</text>
+<text x="180" y="236" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">Usually: nothing new</text>
+<rect x="360" y="40" width="280" height="240" rx="12" fill="none" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4"/>
+<text x="500" y="66" text-anchor="middle" font-size="14" font-weight="500" fill="#3d3d3a">WebSocket push</text>
+<rect x="390" y="84" width="220" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="500" y="102" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041">Server</text>
+<text x="500" y="120" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">Pushes only on change</text>
+<line x1="500" y1="140" x2="500" y2="198" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar1)"/>
+<rect x="390" y="200" width="220" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="500" y="218" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041">Client</text>
+<text x="500" y="236" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">Listens on open socket</text>
+</svg>
+
+WebSockets also give us a channel back: the client can send "subscribe me to this new match" or "unsubscribe from tennis" over the same connection, and the server adjusts what it sends. This subscription model matters — no client wants all 300 bookmakers × 12,000 tournaments. They want their slice.
+
+So: WebSockets solve the last mile, the hop between our system and the client. But we haven't built the system yet. Where do the odds come from, and what happens to them before they reach that WebSocket?
+
+## The input side: 300 sources, 300 headaches
+
+Here's an assumption worth making explicit: **the 300 bookmaker feeds are not under our control, and they are all different.** Some bookmakers offer their own WebSocket streams. Some offer REST APIs we have to poll. Some offer nothing, and the data has to be scraped from their websites. They use different formats (JSON here, XML there, a binary protocol somewhere else), different update frequencies, and — this is the sneaky one — **different names for the same things**.
+
+One bookmaker lists a match as "Man Utd v Man City." Another says "Manchester United — Manchester City." A third uses an internal ID like `evt_884213`. They are all the same fixture, but nothing in the data says so. The same applies to markets ("Over/Under 2.5" vs "Total Goals 2.5") and outcomes.
+
+This gives us the first two components of our system.
+
+**Connector adapters.** One small program per source (or per source *type*). The adapter that talks to Bookmaker A's WebSocket knows how to keep that connection alive and reconnect when it drops. The adapter for Bookmaker B knows how to poll their REST API politely. The adapter for Bookmaker C drives a headless browser to scrape prices off a page. Each adapter has exactly one job: get raw data out of one source and hand it inward. The key design idea is **isolation** — when Bookmaker C's website changes its HTML at 2am and the scraper breaks, only that one adapter fails. The other 299 sources keep flowing. Adapters are the crumple zone of the system: they absorb the chaos of the outside world so nothing else has to.
+
+**The normalization service.** Raw events from adapters flow into a service whose job is translation. It converts every incoming update into one canonical internal format — something like `{market_id, bookmaker, outcome, price, timestamp}` — and, crucially, it performs **entity resolution**: mapping each bookmaker's naming for a fixture, market, or outcome onto our own internal ID. To do this it consults a **reference data store** (a plain relational database like PostgreSQL is a good fit) holding the mapping tables: "Bookmaker A's `evt_884213` = our `fixture_29871`."
+
+Entity resolution sounds mundane and is quietly the hardest ongoing problem in this whole system, because it's never finished — new tournaments, new naming quirks, new bookmakers arrive constantly. It's partly a code problem and partly a tooling-and-humans problem. But once an event exits normalization, everything downstream can rely on one clean, consistent shape. That contract is the payoff.
+
+At this point we have clean events being produced on one side, and WebSocket connections waiting on the other side. The tempting move is to connect them directly: normalization finishes an event, loops over the WebSocket servers, and sends it to each. Let's see why that's a trap.
+
+## Why we don't wire the middle directly
+
+Think about what direct calls mean. The normalization service must maintain a list of every WebSocket server, so every time we add or remove a server, normalization has to know. If one WebSocket server is slow or restarting mid-deploy, normalization either waits on it (slowing everyone down) or skips it (losing data for that server's clients). If a WebSocket server crashes and comes back thirty seconds later, everything published during those thirty seconds is simply gone — nobody kept it. And when the risk team later asks "can our new analytics service also receive this stream?", you have to modify normalization *again* to add another destination.
+
+Every one of these problems comes from the same root: **the producer of data knows too much about its consumers.** They're coupled. What we want is a component in the middle whose entire purpose is to *be* the middle — so producers and consumers never have to know about each other at all.
+
+## Concept 2: the event bus
+
+An **event bus** (also called a message broker or event streaming platform) is infrastructure with one deceptively simple job. Producers publish events *to the bus*. Consumers read events *from the bus*. Neither side knows the other exists.
+
+The normalization service finishes processing an update and publishes one message — "odds for market X are now 2.35, timestamp T" — to a named channel on the bus (channels are usually called **topics**; ours might be `odds.updates`). Then it moves on to the next event. It doesn't know how many consumers exist, whether they're keeping up, or whether one of them is currently mid-restart. Not its problem anymore.
+
+On the other side, any number of consumers subscribe to the topic and read the stream of events, each at their own pace. Add a new consumer next year? It just subscribes. Nothing upstream changes.
+
+The most widely used tool in this category is **Apache Kafka**, and it adds three properties that turn "convenient middleman" into "backbone of the architecture." They're worth understanding individually.
+
+**First: the bus is a log, not a mailbox.** Kafka doesn't hand a message to a consumer and forget it. It *appends* every event to a durable, ordered log on disk and keeps it for a configurable period. Consumers don't "receive" messages so much as *read* the log, and each consumer tracks its own position in it — a bookmark called an **offset**. This has a beautiful consequence: if a consumer crashes and restarts, it simply resumes reading from its last bookmark. Those thirty seconds of downtime? The events are all still in the log, waiting. Nothing was lost, and nobody had to resend anything.
+
+<svg width="680" viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" role="img" aria-label="The event bus as an ordered log with independent consumer offsets">
+<defs><marker id="ar2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#73726c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="380" y="20" width="200" height="44" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="480" y="42" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#712B13">Producer appends</text>
+<line x1="510" y1="64" x2="510" y2="98" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar2)"/>
+<g fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5">
+<rect x="60" y="100" width="60" height="44" rx="4"/><rect x="120" y="100" width="60" height="44" rx="4"/><rect x="180" y="100" width="60" height="44" rx="4"/><rect x="240" y="100" width="60" height="44" rx="4"/><rect x="300" y="100" width="60" height="44" rx="4"/><rect x="360" y="100" width="60" height="44" rx="4"/><rect x="420" y="100" width="60" height="44" rx="4"/><rect x="480" y="100" width="60" height="44" rx="4"/>
+</g>
+<g text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#3C3489">
+<text x="90" y="122">1</text><text x="150" y="122">2</text><text x="210" y="122">3</text><text x="270" y="122">4</text><text x="330" y="122">5</text><text x="390" y="122">6</text><text x="450" y="122">7</text><text x="510" y="122">8</text>
+</g>
+<text x="60" y="170" font-size="12" fill="#73726c">older</text>
+<text x="540" y="170" text-anchor="end" font-size="12" fill="#73726c">newer</text>
+<line x1="180" y1="218" x2="266" y2="148" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar2)"/>
+<line x1="500" y1="218" x2="452" y2="148" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar2)"/>
+<rect x="60" y="220" width="240" height="56" rx="8" fill="#FBEAF0" stroke="#993556" stroke-width="0.5"/>
+<text x="180" y="238" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#72243E">risk-mgmt group</text>
+<text x="180" y="256" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993556">Own bookmark: at event 4</text>
+<rect x="380" y="220" width="240" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="500" y="238" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041">ws-edge group</text>
+<text x="500" y="256" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">Own bookmark: at event 7</text>
+<text x="340" y="304" text-anchor="middle" font-size="12" fill="#73726c">Same log, independent bookmarks — one slow group never blocks another</text>
+</svg>
+
+**Second: partitions give you ordering and scale.** A busy topic is too much for one machine, so Kafka splits a topic into **partitions** — independent sub-logs that can live on different servers. When publishing, you choose a partition using a key, and here's where a design decision quietly solves a critical requirement: we use `market_id` as the key. That means *all updates for the same market always land in the same partition*, and within a partition, order is strictly preserved. Why does that matter so much? Because the one thing a trading client can never tolerate is seeing prices go *backwards* — receiving a stale price after a fresher one and believing the stale one is current. Partitioning by market ID means the sequence "2.30, then 2.35, then 2.40" for a given market can never arrive shuffled. We get per-market ordering as a structural guarantee, not as something we have to check. (Notice we did *not* ask for global ordering across all markets — we don't need it, and demanding it would destroy our ability to scale. Knowing which ordering guarantee you actually need is one of those distinctions that separates a good design from a hand-wavy one.)
+
+**Third: consumer groups let many teams share one stream.** A **consumer group** is a named set of consumer processes that cooperate to read a topic — Kafka divides the partitions among the group's members automatically. The crucial part: *different* groups are completely independent. Each group has its own offsets and reads the full stream at its own pace. So our WebSocket servers form one group (`ws-edge`), a risk-analytics service forms another (`risk-mgmt`), and tomorrow's machine-learning pipeline forms a third — all consuming the same events, none affecting the others. One slow consumer group lags *itself*; it cannot slow down anyone else. The single stream of truth gets reused endlessly, for free.
+
+One honest caveat, because good design discussions include them: Kafka is not weightless. It's a distributed system you now have to operate, and it adds a few milliseconds of latency versus lighter alternatives like Redis pub/sub (which is blazingly fast but keeps nothing — miss a message and it's gone forever). For a product whose clients trade real money on this data, durability and replay win the argument. But it's an argument, not a reflex.
+
+## The output side: fan-out and its problems
+
+Now the layer that holds the WebSockets: a fleet of **gateway servers**. Each one does the following, continuously: hold open connections to some fraction of our clients (say, a few thousand each), remember what each client subscribed to, consume the event stream from Kafka, and for every event ask "which of *my* clients care about this market and are entitled to see this bookmaker?" — then push it to exactly those connections.
+
+This layer has three problems worth understanding, because they're where real-time systems actually get hard.
+
+**Problem one: connections are sticky, so make the servers interchangeable.** An HTTP request lasts milliseconds and any server can handle it. A WebSocket connection lasts hours and lives on *one specific server* — you can't round-robin it away mid-conversation. The way out is to make the gateway servers **stateless** in every way that matters: no gateway holds data that only it has. All the odds flow through Kafka, which every gateway reads. Client subscriptions can be re-sent by the client on connect. So when a gateway dies, its clients reconnect (through a load balancer) to any other gateway and lose nothing, because the replacement gateway has access to exactly the same stream and can rebuild the same view. The connection is sticky; the *server* is disposable.
+
+**Problem two: slow clients, and the art of dropping messages correctly.** During a busy Saturday of in-play football, updates arrive fast. What if one client's network is struggling and they can only consume half as fast as we're sending? If we buffer everything for them, memory grows without bound and eventually the server dies — taking thousands of *healthy* clients with it. If we drop random messages, the client might miss a price and trade on stale data. The elegant answer is **conflation**: per client, per market, keep only the *latest* price. If a slow client misses three intermediate ticks — 2.30, 2.32, 2.35 — while their connection was congested, we skip straight to 2.35 when they can receive again. This works because of something we identified back in the requirements: clients don't need *every* message, they need the *current truth*. Intermediate prices that were already superseded have no value. Conflation drops exactly the messages that don't matter and never the one that does. Getting delivery semantics right isn't about never dropping anything — it's about knowing precisely what you're allowed to drop.
+
+<svg width="680" viewBox="0 0 680 270" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" role="img" aria-label="Conflation: superseded price ticks are dropped, only the latest is delivered to a slow client">
+<defs><marker id="ar3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#73726c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="50" y="50" width="110" height="32" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="105" y="66" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">2.30 · t1</text>
+<rect x="50" y="104" width="110" height="32" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="105" y="120" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">2.32 · t2</text>
+<rect x="50" y="158" width="110" height="32" rx="4" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+<text x="105" y="174" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#633806">2.35 · t3</text>
+<line x1="160" y1="66" x2="238" y2="106" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar3)"/>
+<line x1="160" y1="120" x2="238" y2="122" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar3)"/>
+<line x1="160" y1="174" x2="238" y2="138" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar3)"/>
+<rect x="240" y="86" width="200" height="72" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="340" y="110" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#3C3489">Conflation buffer</text>
+<text x="340" y="132" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#534AB7">Keeps latest per market</text>
+<line x1="440" y1="122" x2="508" y2="122" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar3)"/>
+<rect x="510" y="94" width="130" height="56" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+<text x="575" y="112" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#633806">Slow client</text>
+<text x="575" y="130" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#854F0B">Gets 2.35 only</text>
+<text x="340" y="240" text-anchor="middle" font-size="12" fill="#73726c">Gray ticks were already superseded — dropping them loses nothing the client needs</text>
+</svg>
+
+**Problem three: reconnection needs a source of truth.** A WebSocket stream carries *changes* — deltas. But a client that just connected (or reconnected after a network blip) has no state to apply deltas *to*. If they just start listening, they know about the markets that happen to tick in the next minute and nothing else. So we add a **snapshot store**: a small service (another Kafka consumer group!) that maintains "current price for every market" in a fast key-value store like Redis, each entry stamped with a sequence number. The client protocol becomes: on connect, receive the full snapshot of your subscribed markets first, then apply the live deltas — using the sequence numbers to discard any delta older than the snapshot you got. This snapshot-then-delta pattern appears in virtually every real-time market data system ever built, because the underlying problem — streams tell you what changed, not what *is* — is universal.
+
+<svg width="680" viewBox="0 0 680 360" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" role="img" aria-label="Snapshot-then-delta resync sequence between client, gateway, and snapshot store">
+<defs><marker id="ar4" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#73726c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="40" y="40" width="170" height="44" rx="8" fill="#FBEAF0" stroke="#993556" stroke-width="0.5"/>
+<text x="125" y="62" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#72243E">Client</text>
+<rect x="255" y="40" width="170" height="44" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="340" y="62" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041">Gateway</text>
+<rect x="470" y="40" width="170" height="44" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="555" y="62" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#444441">Snapshot store</text>
+<line x1="125" y1="84" x2="125" y2="330" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4"/>
+<line x1="340" y1="84" x2="340" y2="330" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4"/>
+<line x1="555" y1="84" x2="555" y2="330" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4"/>
+<text x="232" y="126" text-anchor="middle" font-size="12" fill="#73726c">1 · connect, subscribe, JWT</text>
+<line x1="125" y1="138" x2="338" y2="138" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar4)"/>
+<text x="447" y="176" text-anchor="middle" font-size="12" fill="#73726c">2 · fetch current state</text>
+<line x1="340" y1="188" x2="553" y2="188" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar4)"/>
+<text x="447" y="226" text-anchor="middle" font-size="12" fill="#73726c">3 · full state, seq 4821</text>
+<line x1="555" y1="238" x2="342" y2="238" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar4)"/>
+<text x="232" y="276" text-anchor="middle" font-size="12" fill="#73726c">4 · snapshot, then deltas seq &gt; 4821</text>
+<line x1="340" y1="288" x2="127" y2="288" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar4)"/>
+</svg>
+
+Two smaller components round out the picture. A **load balancer** in front of the gateways — operating at the TCP level rather than the HTTP level, because we're balancing long-lived connections, not individual requests — spreads clients across the fleet. And an **auth service** validates each client at the WebSocket handshake (typically via a signed token like a JWT) and loads their *entitlements*: which sports, which bookmakers, which markets they've paid for. Entitlements come with a subtle wrinkle: a connection authorized at 9am might have its contract change at noon, so a long-lived connection needs a way to be re-checked or terminated mid-flight — authorization can't be a one-time event at the front door.
+
+## The whole picture
+
+Trace one price change through the finished system. A bookmaker moves a price. Their adapter catches it within milliseconds and forwards the raw event. Normalization translates it into the canonical schema, resolving the bookmaker's fixture naming against the reference store. The clean event is published to Kafka, landing in the partition owned by its `market_id`, behind every previous update for that market and in front of every future one. Three consumer groups pick it up independently: the snapshot service overwrites its Redis entry for that market, the risk pipeline updates its models, and every gateway server checks the event against its connected clients' subscriptions and pushes a small frame down each matching WebSocket. Total time, source to screen: tens of milliseconds.
+
+<svg width="680" viewBox="0 0 680 700" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" role="img" aria-label="Full end-to-end architecture: feeds, adapters, normalization, Kafka event bus, snapshot store, WebSocket gateways, load balancer, auth, and clients">
+<defs><marker id="ar5" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#73726c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="60" y="20" width="250" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="185" y="38" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#712B13">External feeds</text>
+<text x="185" y="56" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993C1D">300+ bookmakers, mixed protocols</text>
+<line x1="185" y1="76" x2="185" y2="116" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="60" y="118" width="250" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="185" y="136" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#712B13">Connector adapters</text>
+<text x="185" y="154" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993C1D">One per source type, push or poll</text>
+<line x1="185" y1="174" x2="185" y2="214" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="60" y="216" width="250" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="185" y="234" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#712B13">Normalization service</text>
+<text x="185" y="252" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993C1D">Canonical schema, entity resolution</text>
+<rect x="420" y="216" width="200" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="520" y="234" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#444441">Reference data store</text>
+<text x="520" y="252" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">Fixture and market ID mappings</text>
+<line x1="310" y1="244" x2="418" y2="244" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<line x1="185" y1="272" x2="185" y2="312" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="60" y="314" width="560" height="70" rx="14" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="340" y="340" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#3C3489">Event bus — Kafka</text>
+<text x="340" y="360" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#534AB7">Topic odds.updates, partitioned by market_id, ordered per partition</text>
+<line x1="520" y1="384" x2="520" y2="424" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<line x1="185" y1="384" x2="185" y2="424" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="420" y="426" width="200" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="520" y="444" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#444441">Snapshot store</text>
+<text x="520" y="462" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">Latest state per market, Redis</text>
+<rect x="60" y="426" width="250" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="185" y="444" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041">WebSocket gateways</text>
+<text x="185" y="462" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">Stateless fleet, per-client filtering</text>
+<path d="M420 454 L340 454 L340 482 L312 482" fill="none" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4" marker-end="url(#ar5)"/>
+<text x="366" y="500" text-anchor="middle" font-size="12" fill="#73726c">snapshot on connect</text>
+<line x1="185" y1="482" x2="185" y2="522" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="60" y="524" width="250" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="185" y="542" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041">Load balancer</text>
+<text x="185" y="560" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">L4, connection-aware</text>
+<rect x="420" y="524" width="200" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="520" y="542" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#444441">Auth service</text>
+<text x="520" y="560" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">JWT, per-client entitlements</text>
+<path d="M420 552 L340 552 L340 510 L312 510" fill="none" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4" marker-end="url(#ar5)"/>
+<text x="382" y="542" text-anchor="middle" font-size="12" fill="#73726c">auth check</text>
+<line x1="185" y1="580" x2="185" y2="618" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="60" y="620" width="250" height="56" rx="8" fill="#FBEAF0" stroke="#993556" stroke-width="0.5"/>
+<text x="185" y="638" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#72243E">Clients</text>
+<text x="185" y="656" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993556">Hedge funds, sportsbooks, brokers</text>
+</svg>
+
+Now notice what the architecture bought us — the part that's easy to miss when you only see the final diagram. Every component can **fail independently without cascading**. A scraper breaks: one source goes stale, 299 keep flowing. A gateway crashes: its clients reconnect elsewhere, pull a snapshot, resume — the log kept everything in the meantime. A consumer group falls behind: it lags itself, and a metric called **consumer lag** (how far behind the log's head a group is reading) tells your on-call engineer exactly where the pain is. And every layer **scales along its own axis**: more bookmakers means more adapters, more clients means more gateways, more throughput means more partitions — each independently, none requiring changes to the others.
+
+That independence isn't decoration. It's the entire reason the system is shaped this way. Every box in the diagram exists because gluing its responsibilities onto a neighbor would couple two things that need to fail, scale, or evolve separately. The bus isn't there because Kafka is fashionable; it's there because the alternative is a producer that must know its consumers. The snapshot store isn't there because Redis is fast; it's there because streams carry change, and change is meaningless without a starting point.
+
+Which is, in the end, the transferable lesson. Strip away the sports betting and the same skeleton underlies stock tickers, multiplayer game state, collaborative editors, live dashboards, chat systems: **many unreliable sources, one normalized truth, a durable ordered log in the middle, stateless push servers at the edge, and snapshots for anyone who just walked in.** Learn the shape once, and you'll recognize it everywhere real-time data moves.
+
+
+WebSockets also give us a channel back: the client can send "subscribe me to this new match" or "unsubscribe from tennis" over the same connection, and the server adjusts what it sends. This subscription model matters — no client wants all 300 bookmakers × 12,000 tournaments. They want their slice.
+
+So: WebSockets solve the last mile, the hop between our system and the client. But we haven't built the system yet. Where do the odds come from, and what happens to them before they reach that WebSocket?
+
+## The input side: 300 sources, 300 headaches
+
+Here's an assumption worth making explicit: **the 300 bookmaker feeds are not under our control, and they are all different.** Some bookmakers offer their own WebSocket streams. Some offer REST APIs we have to poll. Some offer nothing, and the data has to be scraped from their websites. They use different formats (JSON here, XML there, a binary protocol somewhere else), different update frequencies, and — this is the sneaky one — **different names for the same things**.
+
+One bookmaker lists a match as "Man Utd v Man City." Another says "Manchester United — Manchester City." A third uses an internal ID like `evt_884213`. They are all the same fixture, but nothing in the data says so. The same applies to markets ("Over/Under 2.5" vs "Total Goals 2.5") and outcomes.
+
+This gives us the first two components of our system.
+
+**Connector adapters.** One small program per source (or per source *type*). The adapter that talks to Bookmaker A's WebSocket knows how to keep that connection alive and reconnect when it drops. The adapter for Bookmaker B knows how to poll their REST API politely. The adapter for Bookmaker C drives a headless browser to scrape prices off a page. Each adapter has exactly one job: get raw data out of one source and hand it inward. The key design idea is **isolation** — when Bookmaker C's website changes its HTML at 2am and the scraper breaks, only that one adapter fails. The other 299 sources keep flowing. Adapters are the crumple zone of the system: they absorb the chaos of the outside world so nothing else has to.
+
+**The normalization service.** Raw events from adapters flow into a service whose job is translation. It converts every incoming update into one canonical internal format — something like `{market_id, bookmaker, outcome, price, timestamp}` — and, crucially, it performs **entity resolution**: mapping each bookmaker's naming for a fixture, market, or outcome onto our own internal ID. To do this it consults a **reference data store** (a plain relational database like PostgreSQL is a good fit) holding the mapping tables: "Bookmaker A's `evt_884213` = our `fixture_29871`."
+
+Entity resolution sounds mundane and is quietly the hardest ongoing problem in this whole system, because it's never finished — new tournaments, new naming quirks, new bookmakers arrive constantly. It's partly a code problem and partly a tooling-and-humans problem. But once an event exits normalization, everything downstream can rely on one clean, consistent shape. That contract is the payoff.
+
+At this point we have clean events being produced on one side, and WebSocket connections waiting on the other side. The tempting move is to connect them directly: normalization finishes an event, loops over the WebSocket servers, and sends it to each. Let's see why that's a trap.
+
+## Why we don't wire the middle directly
+
+Think about what direct calls mean. The normalization service must maintain a list of every WebSocket server, so every time we add or remove a server, normalization has to know. If one WebSocket server is slow or restarting mid-deploy, normalization either waits on it (slowing everyone down) or skips it (losing data for that server's clients). If a WebSocket server crashes and comes back thirty seconds later, everything published during those thirty seconds is simply gone — nobody kept it. And when the risk team later asks "can our new analytics service also receive this stream?", you have to modify normalization *again* to add another destination.
+
+Every one of these problems comes from the same root: **the producer of data knows too much about its consumers.** They're coupled. What we want is a component in the middle whose entire purpose is to *be* the middle — so producers and consumers never have to know about each other at all.
+
+## Concept 2: the event bus
+
+An **event bus** (also called a message broker or event streaming platform) is infrastructure with one deceptively simple job. Producers publish events *to the bus*. Consumers read events *from the bus*. Neither side knows the other exists.
+
+The normalization service finishes processing an update and publishes one message — "odds for market X are now 2.35, timestamp T" — to a named channel on the bus (channels are usually called **topics**; ours might be `odds.updates`). Then it moves on to the next event. It doesn't know how many consumers exist, whether they're keeping up, or whether one of them is currently mid-restart. Not its problem anymore.
+
+On the other side, any number of consumers subscribe to the topic and read the stream of events, each at their own pace. Add a new consumer next year? It just subscribes. Nothing upstream changes.
+
+The most widely used tool in this category is **Apache Kafka**, and it adds three properties that turn "convenient middleman" into "backbone of the architecture." They're worth understanding individually.
+
+**First: the bus is a log, not a mailbox.** Kafka doesn't hand a message to a consumer and forget it. It *appends* every event to a durable, ordered log on disk and keeps it for a configurable period. Consumers don't "receive" messages so much as *read* the log, and each consumer tracks its own position in it — a bookmark called an **offset**. This has a beautiful consequence: if a consumer crashes and restarts, it simply resumes reading from its last bookmark. Those thirty seconds of downtime? The events are all still in the log, waiting. Nothing was lost, and nobody had to resend anything.
+
+<svg width="680" viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" role="img" aria-label="The event bus as an ordered log with independent consumer offsets">
+<defs><marker id="ar2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#73726c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="380" y="20" width="200" height="44" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="480" y="42" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#712B13">Producer appends</text>
+<line x1="510" y1="64" x2="510" y2="98" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar2)"/>
+<g fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5">
+<rect x="60" y="100" width="60" height="44" rx="4"/><rect x="120" y="100" width="60" height="44" rx="4"/><rect x="180" y="100" width="60" height="44" rx="4"/><rect x="240" y="100" width="60" height="44" rx="4"/><rect x="300" y="100" width="60" height="44" rx="4"/><rect x="360" y="100" width="60" height="44" rx="4"/><rect x="420" y="100" width="60" height="44" rx="4"/><rect x="480" y="100" width="60" height="44" rx="4"/>
+</g>
+<g text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#3C3489">
+<text x="90" y="122">1</text><text x="150" y="122">2</text><text x="210" y="122">3</text><text x="270" y="122">4</text><text x="330" y="122">5</text><text x="390" y="122">6</text><text x="450" y="122">7</text><text x="510" y="122">8</text>
+</g>
+<text x="60" y="170" font-size="12" fill="#73726c">older</text>
+<text x="540" y="170" text-anchor="end" font-size="12" fill="#73726c">newer</text>
+<line x1="180" y1="218" x2="266" y2="148" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar2)"/>
+<line x1="500" y1="218" x2="452" y2="148" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar2)"/>
+<rect x="60" y="220" width="240" height="56" rx="8" fill="#FBEAF0" stroke="#993556" stroke-width="0.5"/>
+<text x="180" y="238" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#72243E">risk-mgmt group</text>
+<text x="180" y="256" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993556">Own bookmark: at event 4</text>
+<rect x="380" y="220" width="240" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="500" y="238" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041">ws-edge group</text>
+<text x="500" y="256" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">Own bookmark: at event 7</text>
+<text x="340" y="304" text-anchor="middle" font-size="12" fill="#73726c">Same log, independent bookmarks — one slow group never blocks another</text>
+</svg>
+
+**Second: partitions give you ordering and scale.** A busy topic is too much for one machine, so Kafka splits a topic into **partitions** — independent sub-logs that can live on different servers. When publishing, you choose a partition using a key, and here's where a design decision quietly solves a critical requirement: we use `market_id` as the key. That means *all updates for the same market always land in the same partition*, and within a partition, order is strictly preserved. Why does that matter so much? Because the one thing a trading client can never tolerate is seeing prices go *backwards* — receiving a stale price after a fresher one and believing the stale one is current. Partitioning by market ID means the sequence "2.30, then 2.35, then 2.40" for a given market can never arrive shuffled. We get per-market ordering as a structural guarantee, not as something we have to check. (Notice we did *not* ask for global ordering across all markets — we don't need it, and demanding it would destroy our ability to scale. Knowing which ordering guarantee you actually need is one of those distinctions that separates a good design from a hand-wavy one.)
+
+**Third: consumer groups let many teams share one stream.** A **consumer group** is a named set of consumer processes that cooperate to read a topic — Kafka divides the partitions among the group's members automatically. The crucial part: *different* groups are completely independent. Each group has its own offsets and reads the full stream at its own pace. So our WebSocket servers form one group (`ws-edge`), a risk-analytics service forms another (`risk-mgmt`), and tomorrow's machine-learning pipeline forms a third — all consuming the same events, none affecting the others. One slow consumer group lags *itself*; it cannot slow down anyone else. The single stream of truth gets reused endlessly, for free.
+
+One honest caveat, because good design discussions include them: Kafka is not weightless. It's a distributed system you now have to operate, and it adds a few milliseconds of latency versus lighter alternatives like Redis pub/sub (which is blazingly fast but keeps nothing — miss a message and it's gone forever). For a product whose clients trade real money on this data, durability and replay win the argument. But it's an argument, not a reflex.
+
+## The output side: fan-out and its problems
+
+Now the layer that holds the WebSockets: a fleet of **gateway servers**. Each one does the following, continuously: hold open connections to some fraction of our clients (say, a few thousand each), remember what each client subscribed to, consume the event stream from Kafka, and for every event ask "which of *my* clients care about this market and are entitled to see this bookmaker?" — then push it to exactly those connections.
+
+This layer has three problems worth understanding, because they're where real-time systems actually get hard.
+
+**Problem one: connections are sticky, so make the servers interchangeable.** An HTTP request lasts milliseconds and any server can handle it. A WebSocket connection lasts hours and lives on *one specific server* — you can't round-robin it away mid-conversation. The way out is to make the gateway servers **stateless** in every way that matters: no gateway holds data that only it has. All the odds flow through Kafka, which every gateway reads. Client subscriptions can be re-sent by the client on connect. So when a gateway dies, its clients reconnect (through a load balancer) to any other gateway and lose nothing, because the replacement gateway has access to exactly the same stream and can rebuild the same view. The connection is sticky; the *server* is disposable.
+
+**Problem two: slow clients, and the art of dropping messages correctly.** During a busy Saturday of in-play football, updates arrive fast. What if one client's network is struggling and they can only consume half as fast as we're sending? If we buffer everything for them, memory grows without bound and eventually the server dies — taking thousands of *healthy* clients with it. If we drop random messages, the client might miss a price and trade on stale data. The elegant answer is **conflation**: per client, per market, keep only the *latest* price. If a slow client misses three intermediate ticks — 2.30, 2.32, 2.35 — while their connection was congested, we skip straight to 2.35 when they can receive again. This works because of something we identified back in the requirements: clients don't need *every* message, they need the *current truth*. Intermediate prices that were already superseded have no value. Conflation drops exactly the messages that don't matter and never the one that does. Getting delivery semantics right isn't about never dropping anything — it's about knowing precisely what you're allowed to drop.
+
+<svg width="680" viewBox="0 0 680 270" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" role="img" aria-label="Conflation: superseded price ticks are dropped, only the latest is delivered to a slow client">
+<defs><marker id="ar3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#73726c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="50" y="50" width="110" height="32" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="105" y="66" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">2.30 · t1</text>
+<rect x="50" y="104" width="110" height="32" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="105" y="120" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">2.32 · t2</text>
+<rect x="50" y="158" width="110" height="32" rx="4" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+<text x="105" y="174" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#633806">2.35 · t3</text>
+<line x1="160" y1="66" x2="238" y2="106" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar3)"/>
+<line x1="160" y1="120" x2="238" y2="122" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar3)"/>
+<line x1="160" y1="174" x2="238" y2="138" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar3)"/>
+<rect x="240" y="86" width="200" height="72" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="340" y="110" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#3C3489">Conflation buffer</text>
+<text x="340" y="132" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#534AB7">Keeps latest per market</text>
+<line x1="440" y1="122" x2="508" y2="122" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar3)"/>
+<rect x="510" y="94" width="130" height="56" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+<text x="575" y="112" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#633806">Slow client</text>
+<text x="575" y="130" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#854F0B">Gets 2.35 only</text>
+<text x="340" y="240" text-anchor="middle" font-size="12" fill="#73726c">Gray ticks were already superseded — dropping them loses nothing the client needs</text>
+</svg>
+
+**Problem three: reconnection needs a source of truth.** A WebSocket stream carries *changes* — deltas. But a client that just connected (or reconnected after a network blip) has no state to apply deltas *to*. If they just start listening, they know about the markets that happen to tick in the next minute and nothing else. So we add a **snapshot store**: a small service (another Kafka consumer group!) that maintains "current price for every market" in a fast key-value store like Redis, each entry stamped with a sequence number. The client protocol becomes: on connect, receive the full snapshot of your subscribed markets first, then apply the live deltas — using the sequence numbers to discard any delta older than the snapshot you got. This snapshot-then-delta pattern appears in virtually every real-time market data system ever built, because the underlying problem — streams tell you what changed, not what *is* — is universal.
+
+<svg width="680" viewBox="0 0 680 360" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" role="img" aria-label="Snapshot-then-delta resync sequence between client, gateway, and snapshot store">
+<defs><marker id="ar4" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#73726c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="40" y="40" width="170" height="44" rx="8" fill="#FBEAF0" stroke="#993556" stroke-width="0.5"/>
+<text x="125" y="62" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#72243E">Client</text>
+<rect x="255" y="40" width="170" height="44" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="340" y="62" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041">Gateway</text>
+<rect x="470" y="40" width="170" height="44" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="555" y="62" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#444441">Snapshot store</text>
+<line x1="125" y1="84" x2="125" y2="330" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4"/>
+<line x1="340" y1="84" x2="340" y2="330" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4"/>
+<line x1="555" y1="84" x2="555" y2="330" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4"/>
+<text x="232" y="126" text-anchor="middle" font-size="12" fill="#73726c">1 · connect, subscribe, JWT</text>
+<line x1="125" y1="138" x2="338" y2="138" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar4)"/>
+<text x="447" y="176" text-anchor="middle" font-size="12" fill="#73726c">2 · fetch current state</text>
+<line x1="340" y1="188" x2="553" y2="188" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar4)"/>
+<text x="447" y="226" text-anchor="middle" font-size="12" fill="#73726c">3 · full state, seq 4821</text>
+<line x1="555" y1="238" x2="342" y2="238" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar4)"/>
+<text x="232" y="276" text-anchor="middle" font-size="12" fill="#73726c">4 · snapshot, then deltas seq &gt; 4821</text>
+<line x1="340" y1="288" x2="127" y2="288" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar4)"/>
+</svg>
+
+Two smaller components round out the picture. A **load balancer** in front of the gateways — operating at the TCP level rather than the HTTP level, because we're balancing long-lived connections, not individual requests — spreads clients across the fleet. And an **auth service** validates each client at the WebSocket handshake (typically via a signed token like a JWT) and loads their *entitlements*: which sports, which bookmakers, which markets they've paid for. Entitlements come with a subtle wrinkle: a connection authorized at 9am might have its contract change at noon, so a long-lived connection needs a way to be re-checked or terminated mid-flight — authorization can't be a one-time event at the front door.
+
+## The whole picture
+
+Trace one price change through the finished system. A bookmaker moves a price. Their adapter catches it within milliseconds and forwards the raw event. Normalization translates it into the canonical schema, resolving the bookmaker's fixture naming against the reference store. The clean event is published to Kafka, landing in the partition owned by its `market_id`, behind every previous update for that market and in front of every future one. Three consumer groups pick it up independently: the snapshot service overwrites its Redis entry for that market, the risk pipeline updates its models, and every gateway server checks the event against its connected clients' subscriptions and pushes a small frame down each matching WebSocket. Total time, source to screen: tens of milliseconds.
+
+<svg width="680" viewBox="0 0 680 700" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" role="img" aria-label="Full end-to-end architecture: feeds, adapters, normalization, Kafka event bus, snapshot store, WebSocket gateways, load balancer, auth, and clients">
+<defs><marker id="ar5" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#73726c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="60" y="20" width="250" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="185" y="38" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#712B13">External feeds</text>
+<text x="185" y="56" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993C1D">300+ bookmakers, mixed protocols</text>
+<line x1="185" y1="76" x2="185" y2="116" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="60" y="118" width="250" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="185" y="136" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#712B13">Connector adapters</text>
+<text x="185" y="154" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993C1D">One per source type, push or poll</text>
+<line x1="185" y1="174" x2="185" y2="214" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="60" y="216" width="250" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="185" y="234" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#712B13">Normalization service</text>
+<text x="185" y="252" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993C1D">Canonical schema, entity resolution</text>
+<rect x="420" y="216" width="200" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="520" y="234" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#444441">Reference data store</text>
+<text x="520" y="252" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">Fixture and market ID mappings</text>
+<line x1="310" y1="244" x2="418" y2="244" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<line x1="185" y1="272" x2="185" y2="312" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="60" y="314" width="560" height="70" rx="14" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="340" y="340" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#3C3489">Event bus — Kafka</text>
+<text x="340" y="360" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#534AB7">Topic odds.updates, partitioned by market_id, ordered per partition</text>
+<line x1="520" y1="384" x2="520" y2="424" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<line x1="185" y1="384" x2="185" y2="424" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="420" y="426" width="200" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="520" y="444" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#444441">Snapshot store</text>
+<text x="520" y="462" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">Latest state per market, Redis</text>
+<rect x="60" y="426" width="250" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="185" y="444" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041">WebSocket gateways</text>
+<text x="185" y="462" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">Stateless fleet, per-client filtering</text>
+<path d="M420 454 L340 454 L340 482 L312 482" fill="none" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4" marker-end="url(#ar5)"/>
+<text x="366" y="500" text-anchor="middle" font-size="12" fill="#73726c">snapshot on connect</text>
+<line x1="185" y1="482" x2="185" y2="522" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="60" y="524" width="250" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="185" y="542" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041">Load balancer</text>
+<text x="185" y="560" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">L4, connection-aware</text>
+<rect x="420" y="524" width="200" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="520" y="542" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#444441">Auth service</text>
+<text x="520" y="560" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A">JWT, per-client entitlements</text>
+<path d="M420 552 L340 552 L340 510 L312 510" fill="none" stroke="#73726c" stroke-width="0.5" stroke-dasharray="4 4" marker-end="url(#ar5)"/>
+<text x="382" y="542" text-anchor="middle" font-size="12" fill="#73726c">auth check</text>
+<line x1="185" y1="580" x2="185" y2="618" stroke="#73726c" stroke-width="1.5" marker-end="url(#ar5)"/>
+<rect x="60" y="620" width="250" height="56" rx="8" fill="#FBEAF0" stroke="#993556" stroke-width="0.5"/>
+<text x="185" y="638" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#72243E">Clients</text>
+<text x="185" y="656" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993556">Hedge funds, sportsbooks, brokers</text>
+</svg>
+
+Now notice what the architecture bought us — the part that's easy to miss when you only see the final diagram. Every component can **fail independently without cascading**. A scraper breaks: one source goes stale, 299 keep flowing. A gateway crashes: its clients reconnect elsewhere, pull a snapshot, resume — the log kept everything in the meantime. A consumer group falls behind: it lags itself, and a metric called **consumer lag** (how far behind the log's head a group is reading) tells your on-call engineer exactly where the pain is. And every layer **scales along its own axis**: more bookmakers means more adapters, more clients means more gateways, more throughput means more partitions — each independently, none requiring changes to the others.
+
+That independence isn't decoration. It's the entire reason the system is shaped this way. Every box in the diagram exists because gluing its responsibilities onto a neighbor would couple two things that need to fail, scale, or evolve separately. The bus isn't there because Kafka is fashionable; it's there because the alternative is a producer that must know its consumers. The snapshot store isn't there because Redis is fast; it's there because streams carry change, and change is meaningless without a starting point.
+
+Which is, in the end, the transferable lesson. Strip away the sports betting and the same skeleton underlies stock tickers, multiplayer game state, collaborative editors, live dashboards, chat systems: **many unreliable sources, one normalized truth, a durable ordered log in the middle, stateless push servers at the edge, and snapshots for anyone who just walked in.** Learn the shape once, and you'll recognize it everywhere real-time data moves.
+
