@@ -618,3 +618,15 @@ Now notice what the architecture bought us — the part that's easy to miss when
 That independence isn't decoration. It's the entire reason the system is shaped this way. Every box in the diagram exists because gluing its responsibilities onto a neighbor would couple two things that need to fail, scale, or evolve separately. The bus isn't there because Kafka is fashionable; it's there because the alternative is a producer that must know its consumers. The snapshot store isn't there because Redis is fast; it's there because streams carry change, and change is meaningless without a starting point.
 
 Which is, in the end, the transferable lesson. Strip away the sports betting and the same skeleton underlies stock tickers, multiplayer game state, collaborative editors, live dashboards, chat systems: **many unreliable sources, one normalized truth, a durable ordered log in the middle, stateless push servers at the edge, and snapshots for anyone who just walked in.** Learn the shape once, and you'll recognize it everywhere real-time data moves.
+
+### aws possible setup
+
+<img width="2000" height="1160" alt="image" src="https://github.com/user-attachments/assets/19b1d787-044f-43fc-8a0a-c8312c865fdb" />
+
+How it maps to concrete AWS services, reading the two paths:
+
+**Ingest path (top).** Bookmaker feeds arrive from the public internet through a NAT Gateway into the VPC. Connector adapters run as ECS tasks — one service per source type, so a broken scraper only restarts its own task. Normalization runs as another ECS service, reading fixture/market ID mappings from **RDS PostgreSQL** (the reference data store), and publishes canonical events to **Amazon MSK** — managed Kafka, which is where the `odds.updates` topic and its `market_id` partitioning live.
+
+**Serving path (bottom).** Clients resolve through **Route 53** to a **Network Load Balancer** — L4, not an ALB, because long-lived WebSocket connections are what's being balanced, not requests. The WebSocket gateways are ECS tasks consuming MSK as one consumer group and pushing to their connected clients. The bidirectional arrow to **ElastiCache (Redis)** is the snapshot store: gateways read current state from it on client connect, and a separate consumer writes it.
+
+**Down the right side**, the cross-cutting services: IAM/Cognito for auth and per-client entitlements, CloudWatch (where **consumer lag** is the single most important alarm — it tells you a consumer group is falling behind before clients notice stale prices), and CloudTrail for audit.
