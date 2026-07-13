@@ -14,6 +14,8 @@
 
 6 - [Partitioning, Sharding & Consistent Hashing](#sharding&partitioning)
 
+7 - [Caching](#caching)
+
 
 # Practical cases or blog posts
 
@@ -962,3 +964,265 @@ If sharding comes up, work through these out loud, in this order:
 - **Dynamo: Amazon's Highly Available Key-value Store (2007)** — §4.2 is the canonical ring + vnodes + preference list description.
 - **DDIA, Chapter 6** — "Partitioning." Kleppmann's framing of range vs. hash vs. fixed-partitions is exactly what senior interviewers expect back from you.
 - **Jump Consistent Hash (Lamping & Veach, 2014)** and **Maglev (2016)** — for showing you know the ring isn't the end of the story.
+
+
+
+<a name="caching"><a/>
+# 7 - Caching
+
+*Everything you need to hold your own on this topic in a system design interview.*
+
+---
+
+## 1. What caching actually buys you
+
+A cache is a small, fast store holding a copy of data whose home is somewhere slower. That's it. But interviewers want you to be precise about *which* problem you're solving, because the answer changes the design:
+
+| Goal | What you're really doing |
+|---|---|
+| **Latency** | Serving from RAM (~100 ns local, ~0.5 ms over the network) instead of disk (~100 µs SSD) or a remote DB (~1–10 ms) |
+| **Throughput / load shedding** | Absorbing reads so the database doesn't have to. A 95% hit rate means the DB sees 5% of traffic — a 20× reduction |
+| **Cost** | Fewer DB replicas, smaller instances |
+
+Note the second one is usually the real reason at scale. **A cache is often a load-bearing structural component, not an optimization.** That distinction matters: if your database *cannot* survive a cold cache, the cache is part of your availability story, and losing it is an outage. Say this out loud in an interview — it's the difference between "I added Redis" and "I understand what I did."
+
+**The precondition for caching to work at all:** the read/write ratio is skewed toward reads, *and* access is skewed toward a subset of keys (Zipfian, usually). If every key is read exactly once, a cache is pure overhead.
+
+### The one law
+
+> **A cache is a copy. Every copy can be stale. Everything hard about caching follows from this sentence.**
+
+---
+
+## 2. Where caches live
+
+Work outward from the client — interviewers like candidates who name the whole stack rather than jumping straight to Redis:
+
+1. **Client / browser cache** — HTTP `Cache-Control`, `ETag`, `Last-Modified`. Free, zero network hops, and completely uncontrollable once you've shipped it (you cannot invalidate a browser cache; you can only set short TTLs or change the URL — which is why bundlers emit `app.9f3a2b.js`).
+2. **CDN / edge** (CloudFront, Cloudflare, Fastly) — caches static assets and increasingly API responses near the user. Kills latency by *geography*, not just by speed.
+3. **Reverse proxy** (Nginx, Varnish) — in front of your app.
+4. **Application-local / in-process cache** — a dict, an LRU, Caffeine/Guava in JVM land. Nanosecond access, but *per process*: with 6 gateway containers you have 6 independent caches that will disagree with each other. Great for tiny, rarely-changing reference data; dangerous for anything else.
+5. **Distributed cache** (Redis, Memcached) — a shared tier every app instance talks to. One network hop, one shared truth. This is what people mean by "the cache."
+6. **Database-internal caches** — Postgres `shared_buffers`, the OS page cache, the query plan cache. Already there, and often the reason a "slow query" is fast the second time you run it.
+
+**Redis vs Memcached**, since it gets asked: Memcached is a pure LRU key-value blob store, multithreaded, dead simple. Redis has data structures (sorted sets, hashes, streams), persistence (RDB/AOF), replication, Lua scripting, pub/sub, and Cluster mode. Pick Memcached if you truly need a dumb cache and nothing else; in practice most teams pick Redis because they eventually want one of those extras.
+
+**Multi-level caching** is normal (L1 in-process, L2 Redis, L3 DB). The gotcha: your L1 makes invalidation *distributed* — you now need a pub/sub channel to tell every process to drop its local copy.
+
+---
+
+## 3. Caching patterns (know all four, and their failure modes)
+
+### 3.1 Cache-aside (lazy loading) — the default
+
+The **application** owns the logic. The cache is dumb.
+
+```python
+def get_user(user_id: int) -> dict | None:
+    key = f"user:{user_id}"
+
+    cached = redis.get(key)
+    if cached is not None:
+        return json.loads(cached)          # hit
+
+    user = db.fetch_user(user_id)          # miss → go to source of truth
+    if user is not None:
+        redis.setex(key, 300, json.dumps(user))   # populate, TTL 5 min
+    return user
+```
+
+- ✅ Only requested data is cached. Cache failure is survivable — you just hit the DB.
+- ❌ Every miss pays DB latency. First request after a deploy/eviction is always slow. Stale data lives until TTL expires.
+- ❌ **Two callers can race**, both miss, both hit the DB, both write. See §5 (stampede).
+
+This is what ~90% of systems do, and it's the right default answer.
+
+### 3.2 Read-through
+
+Same behaviour, but the *cache library or service* does the DB fetch on a miss, not your application code. The app just calls `cache.get(key)` and a loader function fires underneath. Cleaner code and a natural place to put stampede protection (many libraries coalesce concurrent loads for the same key automatically). Functionally identical from the outside.
+
+### 3.3 Write-through
+
+Write to the cache **and** the DB synchronously, on every write.
+
+- ✅ Cache is never stale.
+- ❌ Every write pays both latencies. And you're caching data nobody may ever read — wasted memory unless your write set is your read set.
+- Usually paired with cache-aside reads.
+
+### 3.4 Write-behind (write-back)
+
+Write to the cache, acknowledge immediately, flush to the DB asynchronously (batched).
+
+- ✅ Fastest writes, absorbs bursts, batches DB writes.
+- ❌ **You can lose acknowledged writes if the cache dies before the flush.** The cache became your source of truth without you meaning it to.
+- Appropriate for high-volume, loss-tolerant data (view counters, metrics, "last seen" timestamps). Never for money.
+
+### The fifth pattern: write-invalidate
+
+Not always listed, but it's what most cache-aside systems actually do on update:
+
+```python
+def update_user(user_id: int, data: dict) -> None:
+    db.update_user(user_id, data)      # write the source of truth first
+    redis.delete(f"user:{user_id}")    # then invalidate
+```
+
+**Delete, don't update.** Writing the new value into the cache re-introduces a race (two concurrent updates can write their values in the wrong order, leaving the cache permanently wrong). A delete is idempotent — the next reader repopulates from the DB.
+
+**Order matters, and this is a great follow-up to be ready for.** DB-then-delete leaves a window where a concurrent reader can read the old DB value and write it back to the cache *after* your delete — the classic cache-aside race. Mitigations: short TTL as a backstop (accept it, and bound the damage), **delayed double-delete** (delete again a second later), or drive invalidation off the DB's change log (CDC/Debezium reading the WAL), which is the only genuinely correct answer and the one to mention if pushed.
+
+---
+
+## 4. Eviction and expiry (two different things)
+
+**Expiry (TTL)** = *you* decided this entry is only valid for N seconds.
+**Eviction** = the cache is *full* and must throw something out.
+
+Redis `maxmemory-policy`:
+
+| Policy | Meaning |
+|---|---|
+| `noeviction` | Reject writes when full. Safe for a Redis used as a data store, disastrous for a cache |
+| `allkeys-lru` | Evict least-recently-used across all keys. **The usual choice for a cache** |
+| `allkeys-lfu` | Least-*frequently*-used. Better when you have a stable hot set and occasional scans that would pollute an LRU |
+| `volatile-lru` / `volatile-ttl` | Only evict keys that have a TTL set. Useful when the same Redis holds cache *and* persistent data |
+
+**LRU vs LFU is a real interview question.** LRU is fooled by a scan: one batch job reading a million cold keys evicts your entire hot set. LFU isn't (it counts accesses, with decay). That's why Redis added LFU.
+
+**TTL is your safety net, not your consistency mechanism.** Even with perfect invalidation, put a TTL on everything — it bounds the blast radius of a missed invalidation, and it's the reason a bug leaves you stale for 5 minutes instead of forever.
+
+**Jitter your TTLs.** If you populate 10,000 keys during a deploy all with `TTL=300`, they all expire in the same second and you get a synchronized miss storm. Use `300 + random(0, 60)`.
+
+---
+
+## 5. The famous failure modes
+
+This is the section interviews actually live in. Naming these correctly is a strong signal.
+
+### Thundering herd / cache stampede
+
+One hot key expires. 5,000 concurrent requests all miss, all hit the database for the same row, simultaneously. The DB — which was comfortably serving 5% of traffic — takes 100% of it in one spike and falls over. **The cache didn't fail; its expiry caused the outage.**
+
+Fixes, in increasing order of sophistication:
+
+1. **Locking / request coalescing.** First caller to miss takes a lock (`SET key:lock 1 NX EX 10`) and does the DB fetch; the others wait briefly and retry the cache. One DB query instead of 5,000.
+2. **Probabilistic early expiration (XFetch).** Each reader, as the TTL approaches, has a small and growing chance of deciding to refresh *early*, while the old value is still being served. One unlucky request does the work; nobody ever sees a miss.
+3. **Serve stale while revalidating.** Store the value with a logical expiry *inside* it and a much longer physical TTL. On logical expiry, return the stale value immediately and kick off an async refresh. Latency never spikes. This is what CDNs call `stale-while-revalidate`.
+
+```python
+def get_with_lock(key: str, loader, ttl: int = 300):
+    cached = redis.get(key)
+    if cached is not None:
+        return json.loads(cached)
+
+    # only one caller wins the lock and touches the DB
+    if redis.set(f"lock:{key}", "1", nx=True, ex=10):
+        try:
+            value = loader()
+            redis.setex(key, ttl + random.randint(0, 60), json.dumps(value))
+            return value
+        finally:
+            redis.delete(f"lock:{key}")
+
+    time.sleep(0.05)              # someone else is loading it
+    cached = redis.get(key)
+    return json.loads(cached) if cached else loader()   # fall back
+```
+
+### Cache penetration
+
+Requests for keys that **don't exist anywhere** — every one is a guaranteed miss that reaches the DB. Often malicious (`GET /user/-1` in a loop), and the cache provides zero protection because there's nothing to cache.
+
+Fixes: **cache the negative result** (`user:999 → NULL`, short TTL — 30–60s so a later creation isn't hidden for long), and/or put a **Bloom filter** in front holding all existing IDs (constant memory, no false negatives, so "definitely not present" short-circuits before the DB).
+
+### Cache avalanche
+
+Large numbers of keys expire at once (TTL synchronization) *or* the cache tier itself goes down. The DB gets the full, un-shielded firehose.
+
+Fixes: jitter TTLs; replicate the cache (Redis Sentinel/Cluster) so it's not a SPOF; add a **circuit breaker + rate limiter in front of the database** so a cache outage degrades service instead of destroying it; keep a small in-process L1 as a last line of defence.
+
+### Hot key
+
+One key gets a disproportionate share of traffic (a viral post, a big match). It lives on one Redis shard, and that shard saturates while the rest idle. **Sharding doesn't help — it's one key.** (Same problem as in the partitioning post.)
+
+Fixes: replicate the hot key across N shards under suffixed names (`post:123:0..9`) and read a random one; cache it in-process at the app layer (accept a second of staleness); or put a small local L1 in front of Redis exactly for the top-K keys.
+
+### Big key
+
+A single 50 MB value in Redis. Redis is single-threaded for command execution, so serializing that blocks *every other client*. Split it, or don't cache it.
+
+---
+
+## 6. Invalidation: the actual hard part
+
+> "There are only two hard things in Computer Science: cache invalidation and naming things." — Phil Karlton
+
+The strategies, from weakest to strongest:
+
+1. **TTL only.** Accept bounded staleness. Simple, robust, and correct for a *huge* number of use cases — always ask "how stale is too stale?" before engineering something clever. If the answer is "60 seconds is fine," you're done.
+2. **Explicit invalidation on write.** Delete the key when the underlying row changes. Fails when the write path bypasses your app (a batch job, a DBA, another service).
+3. **Change Data Capture.** Tail the database's replication log (Debezium on Postgres WAL / MySQL binlog) and invalidate from there. Nothing can bypass it, because the WAL *is* the write. This is the strongest and the one to name if the interviewer pushes.
+4. **Versioned keys.** Never invalidate anything; include a version in the key (`user:42:v7`). Writers bump the version. Old entries are unreferenced and get evicted by LRU. Cute, race-free, and costs you memory.
+
+**Cache tagging / group invalidation.** "Invalidate every cached page containing product 99." Redis has no `DELETE WHERE`, and `KEYS *` is an O(N) blocking scan — never run it in production (use `SCAN` if you must). Instead maintain a set: `tag:product:99 → {page:1, page:7, search:foo}`, and on change, read the set and delete its members.
+
+---
+
+## 7. Consistency, honestly
+
+A cache is a replica, so everything from replication applies:
+
+- **A cache makes your system eventually consistent**, whether you meant it to or not. If your product cannot tolerate that, don't cache that data (or use write-through and pay for it).
+- **Read-your-own-writes** is the failure users actually notice: I update my profile, the write goes to the DB, my next read hits a stale cache, and my change "didn't save." Fix by invalidating synchronously on the write path *before* returning, or by routing a user's reads around the cache briefly after they write.
+- **Ask "what's the cost of stale?"** before designing anything. A stale follower count: nobody dies. A stale account balance or a stale betting price: someone loses money. The answer sets your entire design.
+
+---
+
+## 8. Where this shows up in the odds feed
+
+Cross-linking to the practical case, because this is what makes it stick:
+
+- The **Redis snapshot store** is a cache — but of a specific kind. It doesn't cache *the database*; it caches **the current state of a stream**, materialized by a Kafka consumer group. That inverts the usual pattern: it's a **write-through cache populated by the event log**, so it can't go stale relative to a source of truth (it *is* the source of truth for "current price"), and there's no invalidation problem at all. Deriving the cache from the same ordered log the clients read is what buys that.
+- Sequence numbers on each entry are what let a client safely merge snapshot + deltas — the cache-consistency problem is solved by **versioning**, exactly as in §6.4.
+- On a mass reconnect (a gateway dies, thousands of clients reconnect at once and all request snapshots), you get a **thundering herd against Redis**. Mitigate with staggered reconnect backoff *on the client*, plus jitter — the same problem as §5, different tier.
+- **Reference data** (fixture/market ID mappings, entitlements) is the classic cache-aside case: read constantly, changes rarely, tolerates seconds of staleness. In-process L1 with a short TTL is right here, and it's the one place where "just use a TTL" is the complete answer.
+
+---
+
+## 9. The interview checklist
+
+1. **Why are you caching?** Latency or load-shedding? Name it.
+2. **What's the read/write ratio and the access skew?** No skew, no benefit.
+3. **What's the cost of stale data?** This drives everything downstream.
+4. **Which layer?** Browser / CDN / app-local / distributed / DB. Justify.
+5. **Which pattern?** Cache-aside by default; say why if not.
+6. **What's the key schema?** `entity:id:version`. Watch out for keys that vary by user and blow up cardinality.
+7. **TTL + eviction policy?** `allkeys-lru`, jittered TTL, and a TTL on *everything* as a backstop.
+8. **How do you invalidate?** Delete-don't-update, and name CDC if pushed on correctness.
+9. **What happens on a cache miss storm?** Stampede/penetration/avalanche — name them and give a fix each.
+10. **What happens if the cache dies entirely?** If the answer is "the DB dies too," you've built a hidden SPOF — say so, and add a circuit breaker.
+
+### Quickfire answers
+
+**"Cache-aside vs write-through?"** Aside = lazy, only caches what's read, tolerates staleness, cache failure is survivable. Through = eager, never stale, pays write latency, may cache data nobody reads. Aside is the default.
+
+**"Why delete instead of update the cache on a write?"** Delete is idempotent; concurrent updates can't interleave into a permanently-wrong cached value. Next read repopulates.
+
+**"What's a thundering herd, and how do you stop it?"** One hot key expires, thousands of concurrent misses hit the DB at once. Lock/coalesce, refresh probabilistically before expiry, or serve stale while revalidating.
+
+**"How do you stop lookups for non-existent keys hitting the DB?"** Cache the null (short TTL) and/or a Bloom filter of existing IDs.
+
+**"What if one key is 100× hotter than the rest?"** Sharding won't help — replicate the key under N suffixed names, or cache it in-process. Consistent hashing balances keys, not traffic.
+
+**"LRU or LFU?"** LRU by default; LFU when a periodic scan would otherwise evict your hot set.
+
+**"Is your cache a SPOF?"** Only if your DB can't survive its loss. Test with a cold-cache load test — if the DB folds, the cache is a dependency, not an optimization.
+
+---
+
+## 10. Further reading
+
+- **DDIA, Chapter 5** — replication. A cache is a replica; every staleness anomaly there applies here.
+- **Facebook, "Scaling Memcache at Facebook" (NSDI 2013)** — the canonical paper. Leases (their stampede fix), the delete-don't-update rule, and cold-cluster warmup, all from a system at absurd scale.
+- **Vattani et al., "Optimal Probabilistic Cache Stampede Prevention" (2015)** — the XFetch early-expiry algorithm.
+- **Redis docs on `maxmemory-policy` and key eviction** — short, and the LRU-approximation detail (Redis samples rather than maintaining a true LRU list) is a nice thing to know.
