@@ -12,9 +12,13 @@
 
 5 - [Communication in Real-Time - WebSockets](#websockets)
 
+6 - [Partitioning, Sharding & Consistent Hashing](#sharding&partitioning)
+
+
 # Practical cases or blog posts
 
 - [Building Real time feed](#oddfeed)
+
 
 
 <a name="cap-theorem-section"><a/>
@@ -679,3 +683,282 @@ Where the containers physically run depends on the **launch type**:
 
 <img width="2000" height="1160" alt="image" src="https://github.com/user-attachments/assets/c1af22d5-fe06-480f-aab0-39c6fbc1b81f" />
 
+
+<a name="sharding&partitioning"><a/>
+# 6 - Partitioning, Sharding & Consistent Hashing
+
+# Partitioning, Sharding & Consistent Hashing
+
+*Everything you need to hold your own on this topic in a system design interview.*
+
+---
+
+## 1. The problem: one machine is not enough
+
+You have 50 TB of user data and 500k writes per second. No single Postgres box takes that. You have three levers:
+
+| Lever | What it fixes | What it doesn't |
+|---|---|---|
+| **Vertical scaling** | Buys you time | Hard ceiling, expensive, single point of failure |
+| **Replication** | Read throughput, availability | Every replica still stores *all* the data; writes still go to one leader |
+| **Partitioning (sharding)** | Storage *and* write throughput | Adds a routing problem, cross-shard queries, rebalancing |
+
+**Partitioning** = splitting one logical dataset into N subsets, each owned by a different node. Every key belongs to exactly one partition. Partitioning and replication are orthogonal and almost always used together: you partition into N shards, then replicate each shard 3×.
+
+> Terminology: "partition" (Kafka, Cassandra, DDIA), "shard" (MongoDB, Elasticsearch, Vitess), "region" (HBase), "vBucket" (Couchbase). Same idea. In interviews, use whichever the interviewer used.
+
+Also distinguish:
+- **Horizontal partitioning** — split by *rows* (users A–M here, N–Z there). This is sharding. This is what the rest of the post is about.
+- **Vertical partitioning** — split by *columns/tables* (profile data here, billing data there). Really just service decomposition.
+
+---
+
+## 2. How do you decide which node owns a key?
+
+### 2.1 Range partitioning
+
+Sort keys and slice into contiguous ranges: `a–f → shard 0`, `g–m → shard 1`, …
+
+- ✅ **Range scans are cheap.** "Give me all events between 09:00 and 10:00" hits one shard.
+- ❌ **Hotspots.** If your key is a timestamp, *all* current writes land on the last shard. Classic anti-pattern.
+- Used by: HBase, Bigtable, CockroachDB, MongoDB (ranged sharding).
+
+Mitigation for the timestamp problem: prefix the key with something high-cardinality (`{sensor_id}:{timestamp}`), which restores write spread but means a time-range scan now hits every shard.
+
+### 2.2 Hash partitioning
+
+`shard = hash(key) % N`.
+
+- ✅ **Uniform load** if the hash is decent (MD5, MurmurHash, xxHash — *not* Python's `hash()`, which is randomized per process, and not a cryptographic hash you're paying for unnecessarily).
+- ❌ **Range scans are dead.** Adjacent keys land on unrelated shards.
+- ❌ **And the big one: `% N` breaks catastrophically when N changes.** See below.
+
+### 2.3 Directory / lookup-based
+
+Keep an explicit map `key-range → shard` in a coordination service (ZooKeeper, etcd) or a lookup table. Vitess and pre-2019 Figma-style setups do this.
+
+- ✅ Total control: you can move any partition anywhere, split hot ones arbitrarily.
+- ❌ The directory is another component to keep available and consistent, and it's on the hot path (so you cache it aggressively and handle staleness).
+
+---
+
+## 3. Why `hash(key) % N` is a trap
+
+This is the setup for consistent hashing, and interviewers love it. Make sure you can produce the number.
+
+You have 4 cache nodes. `shard = hash(key) % 4`. Add a fifth node → `% 5`.
+
+For a key to stay put, you need `hash(key) % 4 == hash(key) % 5`. That's true for roughly 1 in 5 keys. **~80% of your keys now map to a different node.**
+
+Concretely, with 4 nodes:
+
+```
+key       hash   % 4   % 5   moved?
+--------------------------------------
+user:1     102     2     2     no
+user:2     313     1     3     YES
+user:3     577     1     2     YES
+user:4     844     0     4     YES
+```
+
+Consequences:
+- **Cache layer:** near-total miss rate → every request stampedes the database → the database falls over. Adding a node to relieve load *takes the system down*. This is the failure mode that made Akamai invent consistent hashing in 1997.
+- **Database layer:** you must physically move ~80% of your data before the new topology is usable. On 50 TB, that's not a maintenance window, that's a project.
+
+The general rule: with `% N`, changing N moves roughly `(N-1)/N` of the keys. **What we want is to move only ~1/N of the keys** — just the new node's fair share.
+
+---
+
+## 4. Consistent hashing
+
+### The ring
+
+1. Take a hash function with output space `[0, 2^32)`. Bend that range into a circle — 0 and 2^32−1 are adjacent.
+2. Hash each **node** (by name/IP) onto a point on the ring.
+3. Hash each **key** onto a point on the ring.
+4. **A key is owned by the first node you meet walking clockwise from the key's position.**
+
+```
+              0 / 2^32
+                 │
+      NodeC ─────┼───── NodeA
+          ╱      │      ╲
+         ╱   ●k3 │  ●k1  ╲
+        │        │        │
+        │  ●k4   │   ●k2  │
+         ╲       │       ╱
+          ╲______│______╱
+              NodeB
+
+   k1, k2 → NodeB   (first node clockwise)
+   k3     → NodeA
+   k4     → NodeB
+```
+
+### Why it works
+
+**Add a node.** NodeD lands somewhere on the ring between NodeC and NodeA. It takes over exactly the keys in the arc from NodeC to NodeD — keys that used to belong to NodeA. **Nobody else is touched.** Only ~1/N of keys move, and they move from exactly one node.
+
+**Remove a node.** Its arc collapses into its clockwise successor. Only that node's keys move, only to one node. Everyone else is untouched.
+
+That's the whole trick: with `% N`, node identity is *positional* (node #3 of 5), so changing the count renumbers everything. On the ring, node identity is *absolute* (a point at hash 0x8A3F…), so adding a node only perturbs its immediate neighbourhood.
+
+### Virtual nodes (vnodes) — do not skip this
+
+Naive consistent hashing with, say, 5 nodes on the ring has two problems:
+
+1. **Uneven distribution.** Five random points on a circle do not produce five equal arcs. With N random points, the expected largest arc is a *lot* bigger than 1/N — expect load imbalance of 2–3× with small N. One node gets hammered.
+2. **Uneven failure handling.** When a node dies, *its entire load* is dumped on a single successor — which may then die too. Cascading failure.
+
+**Fix:** hash each physical node onto the ring many times — `node_a#0`, `node_a#1`, … `node_a#199`. Each of these is a *virtual node* pointing back to the same physical node.
+
+With ~100–500 vnodes per physical node:
+- Arcs average out; load imbalance drops to a few percent (standard deviation shrinks as ~1/√V).
+- When a node dies, its hundreds of small arcs are inherited by *many different* successors → the load is spread, not dumped.
+- **Heterogeneous hardware falls out for free:** give the beefy box 400 vnodes and the small one 100, and it gets 4× the keys.
+
+This is what Cassandra means by `num_tokens` and what Dynamo calls "tokens."
+
+### Implementation sketch
+
+The standard implementation is a sorted array of vnode hashes plus a binary search — `O(log V)` lookups, no allocation on the hot path.
+
+```python
+import bisect
+import hashlib
+
+class HashRing:
+    def __init__(self, nodes=(), vnodes=150):
+        self.vnodes = vnodes
+        self._ring: dict[int, str] = {}   # hash -> physical node
+        self._sorted: list[int] = []      # sorted hashes, for bisect
+        for n in nodes:
+            self.add_node(n)
+
+    @staticmethod
+    def _hash(key: str) -> int:
+        return int.from_bytes(hashlib.md5(key.encode()).digest()[:4], "big")
+
+    def add_node(self, node: str) -> None:
+        for i in range(self.vnodes):
+            h = self._hash(f"{node}#{i}")
+            self._ring[h] = node
+            bisect.insort(self._sorted, h)
+
+    def remove_node(self, node: str) -> None:
+        for i in range(self.vnodes):
+            h = self._hash(f"{node}#{i}")
+            del self._ring[h]
+            self._sorted.remove(h)
+
+    def get_node(self, key: str) -> str | None:
+        if not self._sorted:
+            return None
+        h = self._hash(key)
+        idx = bisect.bisect(self._sorted, h)   # first vnode clockwise
+        if idx == len(self._sorted):           # wrapped past 2^32
+            idx = 0
+        return self._ring[self._sorted[idx]]
+```
+
+Ten lines of real logic. Being able to write this on a whiteboard is a very reasonable ask in a mid/senior interview.
+
+### Replication on the ring
+
+Replication factor 3? Walk clockwise from the key and take the **first 3 distinct physical nodes**. (Distinct is the important word — otherwise your three "replicas" can be three vnodes of the same box, and you've replicated nothing.) Production systems go further and skip successors in the same rack or availability zone.
+
+This gives you a *preference list* per key, which is exactly what Dynamo/Cassandra use for quorum reads and writes (`R + W > N`).
+
+---
+
+## 5. Consistent hashing isn't the only answer (and often isn't the one used)
+
+Interviewers like this because it shows you're not just reciting the blog-post canon.
+
+**Fixed partitions (a.k.a. hash slots).** Pick a large, *fixed* number of partitions up front — far more than you'll ever have nodes — and assign partitions to nodes via a small map. Redis Cluster uses **16384 hash slots** (`CRC16(key) % 16384`); Elasticsearch fixes shard count at index creation; Kafka fixes partitions per topic. Adding a node just means moving *whole partitions* to it — cheap, explicit, and easy to reason about. The catch: you can't easily change the partition count later, so you must over-provision (this is why resharding Elasticsearch is painful and why Kafka partition counts are a permanent decision).
+
+**Rendezvous hashing (HRW).** For each key, compute `hash(key + node)` for every node and pick the max. Same "only 1/N keys move" property, no ring, no vnodes, trivially supports weights — but lookup is `O(N)` instead of `O(log V)`. Great when N is small (load balancers, caches).
+
+**Jump consistent hash** (Google). ~5 lines, no memory, perfectly balanced, `O(log N)` — but it only maps to bucket *indices* `0..N-1` and can only add/remove buckets at the *end*, so it can't express "node 3 died."
+
+**Maglev hashing** (Google's L4 load balancer). Builds a big lookup table; optimizes for near-perfect balance and fast lookups, tolerating slightly more disruption than the ring.
+
+Good interview line: *"Consistent hashing is the right answer for a large, dynamic, homogeneous fleet with no central coordinator — caches, Dynamo-style stores. If I have a coordinator anyway, fixed partitions with a slot map are simpler to operate and let me move load deliberately."*
+
+---
+
+## 6. The things that actually go wrong
+
+These follow-ups are where interviews are won or lost.
+
+**Hot keys / the celebrity problem.** Consistent hashing balances *keys*, not *traffic*. If one key gets 40% of the reads (Taylor Swift's follower list, a viral post ID), no amount of hashing helps — it's one key, it lives on one node.
+Mitigations: append a random suffix to split the key across shards (`celeb:123:{0..9}`) and fan-out reads; put a dedicated cache in front of the hot key; give hot tenants their own dedicated shard.
+
+**Skewed shards.** Same idea at the tenant level: one B2B customer is 100× everyone else. Detect it, then split it out by hand — this is where a directory-based scheme earns its keep.
+
+**Rebalancing during a move.** While partition P is migrating from node A to node B, who serves reads? Standard answer: keep A authoritative, stream the data to B in the background, then flip the routing atomically and let A forward stragglers for a while. Never rebalance *automatically* on a node timeout — a node that's slow for 30 seconds isn't dead, and auto-rebalancing turns a blip into a data-shuffling storm.
+
+**Cross-shard reads.** A query that isn't scoped by the partition key must be scattered to every shard and gathered — latency becomes p99 of N nodes, which is bad and gets worse with N. This is why **the partition key choice is the single most important design decision**: pick the key that most of your read path already filters by.
+
+**Secondary indexes.** Two options: *local* (each shard indexes its own data → writes are cheap, reads must scatter-gather; Cassandra, Elasticsearch) or *global* (the index itself is partitioned by the indexed term → reads hit one shard, but writes now touch two shards and need distributed-transaction handling; DynamoDB GSIs, which is why they're eventually consistent).
+
+**Cross-shard transactions and joins.** Basically: don't. Denormalize, or co-locate related data by giving them the same partition key (Cassandra's partition key vs. clustering key; DynamoDB's PK vs. SK), or accept two-phase commit and the availability hit.
+
+**Routing: who does the lookup?**
+1. Client-side (client library holds the ring — Memcached clients, Cassandra drivers). Fastest, but every client needs topology.
+2. Proxy/router tier (Vitess, Twemproxy, mongos). Clean, one extra hop.
+3. Any-node redirect (Redis Cluster's `MOVED` responses). Node tells the client where to go.
+
+---
+
+## 7. Real systems (name-drop these correctly)
+
+| System | Scheme |
+|---|---|
+| **Amazon Dynamo / Cassandra / Riak** | Consistent hashing ring + vnodes, replication to the next N distinct nodes |
+| **Redis Cluster** | 16384 fixed hash slots, `CRC16(key) % 16384`, slots assigned to nodes |
+| **Memcached** | Consistent hashing, done entirely in the *client* library |
+| **Kafka** | Fixed partitions per topic; default `murmur2(key) % num_partitions` |
+| **DynamoDB** | Hash of partition key → internal partitions; splits hot/large partitions automatically |
+| **Elasticsearch** | `murmur3(_routing) % num_primary_shards`, fixed at index creation |
+| **MongoDB** | Ranged or hashed sharding + a config-server directory, chunk-based balancer |
+| **Vitess (YouTube)** | Directory/keyspace-based, explicit resharding |
+
+Note the pattern: **stateless-ish caches and leaderless stores use the ring; systems that already have a control plane use fixed partitions + a map.**
+
+---
+
+## 8. The interview checklist
+
+If sharding comes up, work through these out loud, in this order:
+
+1. **Why shard at all?** State the bottleneck — storage, write throughput, or blast radius. Don't shard because it's fun; interviewers will ask if a bigger box or a read replica would do.
+2. **What's the partition key?** Justify it from the read path. Say what it makes cheap and what it makes expensive.
+3. **Range or hash?** Trade range-scan support against hotspot risk.
+4. **How do you add a node?** This is your cue: explain `% N` moving ~80% of keys, then introduce the ring.
+5. **How do you keep it balanced?** Virtual nodes. Explain the two reasons (distribution + smooth failure spread), not just the first.
+6. **How do you replicate?** Next N *distinct* physical nodes clockwise; rack/AZ awareness.
+7. **What about hot keys?** Show you know hashing doesn't solve this. Key-splitting, dedicated cache, dedicated shard.
+8. **How does a client find its data?** Client-side ring / router tier / redirect.
+9. **What breaks?** Cross-shard queries, global secondary indexes, transactions, rebalancing storms.
+
+### Quickfire answers
+
+**"How many keys move when I add the Nth node?"** ~1/N of them, from one node (naive ring) or spread across many (with vnodes). Compare with ~(N−1)/N for modulo.
+
+**"Why not just use `hash % N`?"** Because N changes, and when it does, almost everything moves. Fine only if N is truly fixed forever.
+
+**"Why virtual nodes?"** Even distribution with few physical nodes; spread the failed node's load across many successors instead of one; weight heterogeneous hardware.
+
+**"What's the lookup cost?"** Binary search over a sorted array of V·N vnode hashes: `O(log(V·N))`, in-memory, no network.
+
+**"Does consistent hashing balance load?"** It balances *keys*. Load balance additionally requires that key access is roughly uniform — and it usually isn't.
+
+---
+
+## 9. Further reading
+
+- **Karger et al., 1997** — the original consistent hashing paper (written for web caching, not databases).
+- **Dynamo: Amazon's Highly Available Key-value Store (2007)** — §4.2 is the canonical ring + vnodes + preference list description.
+- **DDIA, Chapter 6** — "Partitioning." Kleppmann's framing of range vs. hash vs. fixed-partitions is exactly what senior interviewers expect back from you.
+- **Jump Consistent Hash (Lamping & Veach, 2014)** and **Maglev (2016)** — for showing you know the ring isn't the end of the story.
