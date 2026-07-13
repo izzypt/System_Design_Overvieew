@@ -630,3 +630,52 @@ How it maps to concrete AWS services, reading the two paths:
 **Serving path (bottom).** Clients resolve through **Route 53** to a **Network Load Balancer** — L4, not an ALB, because long-lived WebSocket connections are what's being balanced, not requests. The WebSocket gateways are ECS tasks consuming MSK as one consumer group and pushing to their connected clients. The bidirectional arrow to **ElastiCache (Redis)** is the snapshot store: gateways read current state from it on client connect, and a separate consumer writes it.
 
 **Down the right side**, the cross-cutting services: IAM/Cognito for auth and per-client entitlements, CloudWatch (where **consumer lag** is the single most important alarm — it tells you a consumer group is falling behind before clients notice stale prices), and CloudTrail for audit.
+
+## NAT Gateway
+
+**Role: lets things in a private subnet make *outbound* connections to the internet, without being reachable *from* the internet.**
+
+Our connector adapters live in a private subnet — they have no public IP, so nothing on the internet can dial into them. That's what we want for security. But they still need to reach *out* to 300 bookmaker websites and APIs. The NAT Gateway is what makes that possible: it sits in a public subnet, and outbound traffic from the private subnet gets routed through it, appearing to the outside world as coming from the NAT's public IP. Return traffic (the bookmaker's response, or the frames of a WebSocket the adapter opened) flows back through it.
+
+**And here's the correction:** the arrow in my diagram points *from* the bookmaker feeds *into* the NAT Gateway, which is misleading. NAT is fundamentally asymmetric — connections must be **initiated from inside**. Bookmakers never connect to us; our adapters connect to them and the odds flow back over connections we opened. So the arrow should really point outward from the adapters, with data returning along it. The dataflow direction (odds coming toward us) and the connection direction (us reaching out) are opposite, and the diagram conflated them.
+
+## Route 53
+
+**Role: DNS. It turns a hostname into an address.**
+
+Clients don't connect to an IP; they connect to something like `wss://feed.55tech.com`. Route 53 is AWS's DNS service, and it answers that lookup with the address of our Network Load Balancer. That's the *whole* job in the basic case.
+
+But it's on the diagram for a second reason: Route 53 can do **health-checked, latency-based, or failover routing**. If we run the serving stack in two regions, Route 53 can send a London client to the London load balancer and a New York client to the US one (latency routing), and if one region goes dark, health checks pull it out of DNS so new connections go to the survivor. For a latency-sensitive product where clients are globally distributed, that's meaningful — DNS becomes the first layer of traffic steering, not just name lookup.
+
+## Amazon MSK
+
+**Role: it's just Kafka, run by AWS instead of by you.**
+
+MSK = "Managed Streaming for Apache Kafka." Everything we discussed about the event bus — the durable ordered log, partitions keyed by `market_id`, offsets, consumer groups — is Kafka semantics, unchanged. MSK doesn't add features; it removes operational work. AWS runs the brokers, handles replication across availability zones, patches them, replaces failed nodes.
+
+The reason it shows up as its own box: Kafka is genuinely painful to self-host well (broker sizing, ZooKeeper/KRaft, rebalancing, disk management). MSK is what you pick when you want Kafka's guarantees without hiring someone to babysit a Kafka cluster. In an interview, saying "Kafka, deployed as MSK" signals you know the difference between the *protocol/semantics* and the *operational burden*.
+
+## CloudWatch
+
+**Role: metrics, logs, and alarms — the system's nervous system.**
+
+Everything emits into it: ECS task CPU/memory, NLB connection counts, MSK broker health, application logs from the gateways. You then define alarms on top ("page someone if X crosses Y").
+
+The one metric worth singling out, and the reason I labeled it that way on the diagram: **consumer lag**. Remember that each consumer group has its own offset — a bookmark into the log. Consumer lag is the distance between a group's bookmark and the head of the log: "how many events behind is this consumer right now?" It's the single best early-warning signal in this whole architecture, because if the WebSocket gateway group starts lagging, it means clients are receiving *stale prices* — and lag climbs *before* anything actually breaks. Nothing errors, nothing crashes; the data just quietly gets old. Without a lag alarm you'd find out from an angry customer instead of from a page.
+
+## ECS — what it actually is
+
+**ECS is not a machine. It's an orchestrator: software that decides which containers run where, keeps them alive, and scales them.**
+
+You give it a **task definition** — essentially "here's a Docker image, give it 1 vCPU and 2GB, these env vars." ECS then runs **tasks** (a running instance of that definition, i.e. a running container) and groups them into a **service**, which is the thing that says "always keep 6 of these running; if one dies, start a replacement; if load rises, add more."
+
+To your question — yes, there are many containers, and the diagram is showing you *services*, not machines. That single "ECS — WebSocket gateways" circle is really *N* identical gateway containers running in parallel, each holding a few thousand client connections. Scaling that tier means telling ECS to run more tasks of that definition. Same for connectors and normalization: three separate ECS services, each with its own count and its own scaling rules. That's the payoff of the stateless design — "add capacity" is just a number change.
+
+Where the containers physically run depends on the **launch type**:
+- **Fargate** — you don't manage servers at all. AWS finds the compute; you just declare CPU/memory per task. Simpler, slightly pricier per unit.
+- **EC2 launch type** — you run a cluster of EC2 VMs yourself and ECS packs containers onto them. More control (instance types, networking tuning), more work.
+
+(This is why the reference diagram shared showed ECS with EC2 instances beside an Auto Scaling Group — that's the EC2 launch type: ASG scales the *VMs*, ECS packs *containers* onto them. Two levels of scaling. With Fargate, the EC2/ASG layer just disappears.)
+
+<img width="2000" height="1160" alt="image" src="https://github.com/user-attachments/assets/c1af22d5-fe06-480f-aab0-39c6fbc1b81f" />
+
