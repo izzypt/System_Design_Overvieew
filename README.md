@@ -16,6 +16,8 @@
 
 7 - [Caching](#caching)
 
+8 - [Replication & Consistency Models](#replcation)
+
 
 # Practical cases or blog posts
 
@@ -1226,3 +1228,317 @@ Cross-linking to the practical case, because this is what makes it stick:
 - **Facebook, "Scaling Memcache at Facebook" (NSDI 2013)** — the canonical paper. Leases (their stampede fix), the delete-don't-update rule, and cold-cluster warmup, all from a system at absurd scale.
 - **Vattani et al., "Optimal Probabilistic Cache Stampede Prevention" (2015)** — the XFetch early-expiry algorithm.
 - **Redis docs on `maxmemory-policy` and key eviction** — short, and the LRU-approximation detail (Redis samples rather than maintaining a true LRU list) is a nice thing to know.
+
+
+<a name="replication"><a/>
+# 8 - Replication & Consistency Models
+
+# Replication & Consistency Models
+
+*Everything you need to hold your own on this topic in a system design interview — starting from first principles.*
+
+---
+
+## 0. First, the vocabulary
+
+Every sentence in this post depends on these words. They get thrown around casually in interviews, so let's pin them down before we need them.
+
+**Node.** One machine (or one process) holding a copy of your data. That's all. "Node," "server," "replica," and "instance" are used almost interchangeably; I'll say *node* for a machine and *replica* for a machine that holds a copy of someone else's data.
+
+**Replication.** Keeping a copy of the same data on multiple nodes. Note what it is *not*: it's not partitioning. Partitioning (the previous post) splits *different* data across machines. Replication puts the *same* data on several machines. Real systems do both: split into 8 shards, then keep 3 copies of each shard.
+
+**Why replicate at all?** Three reasons, and they pull in different directions:
+1. **Availability** — if one node dies, another has the data and can serve.
+2. **Read throughput** — 5 copies means 5 machines can answer reads.
+3. **Latency** — put a copy in São Paulo so Brazilian users don't cross an ocean (~70 ms each way, and no amount of clever code beats the speed of light).
+
+**Source of truth / leader / primary.** The node whose copy is considered authoritative — the one writes go to. Called *leader*, *primary*, or (in older docs) *master*.
+
+**Follower / replica / secondary.** A node that receives a stream of changes from the leader and applies them to its own copy. Reads can be served from here. Writes cannot.
+
+**Replication lag.** The time between "the leader accepted a write" and "this particular follower has applied it." During that window, the follower is **stale** — it will happily answer a read with old data and give you no warning that it did so. Lag is usually milliseconds. Under load, it can be seconds or minutes. **Almost every consistency bug you will ever debug lives inside this window.**
+
+**Consistency.** In this context: *what guarantees do you get about which version of the data a read returns?* That's the whole question. Not "is the data correct" (that's ACID's C, a different thing — see §7).
+
+**Network partition.** The network between two groups of nodes breaks. Both groups are alive and healthy; they just can't talk to each other. Each may believe the other is dead. This is not a rare exotic event — it's a switch reboot, a bad config push, a cross-AZ blip. Assume it will happen.
+
+That's the toolkit. Now the actual content.
+
+---
+
+## 1. Single-leader replication (the default everywhere)
+
+The shape almost every relational database uses out of the box — Postgres, MySQL, SQL Server, and also MongoDB and Kafka (per partition).
+
+```
+            writes
+              │
+              ▼
+        ┌───────────┐
+        │  LEADER   │───── change stream ──┐
+        └───────────┘                      │
+              │                            ▼
+              └── change stream ──┐   ┌──────────┐
+                                  │   │FOLLOWER 1│◄── reads
+                                  ▼   └──────────┘
+                            ┌──────────┐
+                            │FOLLOWER 2│◄── reads
+                            └──────────┘
+```
+
+**The rules:**
+- All writes go to the leader. Only the leader.
+- The leader writes the change to its local log and sends that change to every follower.
+- Followers apply the changes **in the same order** and can serve reads.
+
+**Why this works so well:** there is exactly one place where write order is decided, so there is never a conflict about "which write happened first." That single-writer property is doing an enormous amount of work, and it's why this design dominates.
+
+### What actually gets shipped to the followers
+
+Worth knowing, because it comes up:
+
+- **Statement-based** — send the SQL. Cheap, but broken: `UPDATE ... SET t = NOW()` produces a different result on each node. Mostly abandoned.
+- **Write-ahead log (WAL) shipping** — send the physical, byte-level changes the leader made to its own storage. What Postgres does. Very efficient, but tightly coupled to the storage engine version (you generally can't have a replica on a different major version, which makes zero-downtime upgrades painful).
+- **Logical / row-based** — send "row 42 in table users changed from X to Y." Decoupled from storage internals, so it can be consumed by *other systems*. This is what **Change Data Capture** (CDC, e.g. Debezium) reads to push database changes into Kafka.
+
+### Synchronous vs asynchronous — the trade-off that matters
+
+When the leader gets a write, when does it tell the client "done"?
+
+**Asynchronous:** leader writes locally, replies "OK" immediately, sends to followers whenever.
+- ✅ Fast. The client never waits for a follower.
+- ❌ **If the leader dies before the change reaches any follower, the write is gone forever** — even though you told the client it succeeded. This is *not* a theoretical concern; it's a routine cause of data loss during failover.
+
+**Synchronous:** leader waits for a follower to confirm it has the change, *then* replies "OK."
+- ✅ At least one other machine definitely has your data. Failover loses nothing.
+- ❌ Every write now costs an extra network round-trip. And worse: **if that follower is slow or down, all writes block.** You've made your availability *worse* by adding a machine.
+
+**The pragmatic answer, used by almost everyone: semi-synchronous.** Make exactly *one* follower synchronous and the rest async. You get "the data exists in at least two places" without one flaky replica in Frankfurt being able to halt your writes. If the sync follower goes down, another one is promoted to sync.
+
+If you say only one thing about this in an interview, say: *"async replication means acknowledged writes can be lost on failover; that's the price of the fast path, and semi-sync is how you buy the important part of the guarantee back."*
+
+### Failover: where systems actually break
+
+The leader dies. Now what?
+
+1. **Detect it.** Usually a timeout — no heartbeat for N seconds. Here's the problem, and it's fundamental: **you cannot distinguish "the leader is dead" from "the leader is slow" from "I can't reach the leader."** A 30-second GC pause looks exactly like death.
+2. **Choose a new leader.** Either by an election among the nodes (see *consensus*, §6) or by an external controller. You want the follower with the most up-to-date data.
+3. **Reconfigure.** Clients and remaining followers must all now agree on who the leader is.
+
+**Three ways this goes wrong — worth naming all three:**
+
+- **Lost writes.** With async replication, the new leader may be missing the last few writes the old leader had acknowledged. If you promote it anyway, those writes silently vanish. If the old leader comes back and still has them, they now *conflict* with new writes. The usual fix is brutal: discard the old leader's extra writes.
+- **Split-brain.** The old leader isn't actually dead — it was just unreachable. Now you have **two nodes both accepting writes**, both convinced they're the leader. Data diverges, and you can't merge it back. This is the nightmare scenario. The defence is **fencing** (§6).
+- **Timeout tuning.** Too short → you fail over on a hiccup, causing an outage to prevent one that wasn't happening. Too long → you're down for a minute before anyone notices. There is no correct value, only trade-offs.
+
+---
+
+## 2. The problems replication lag creates (and how users experience them)
+
+This is the heart of the post. Three named anomalies. Interviewers love them because each one is a *concrete user complaint* that maps to a *concrete guarantee*.
+
+### Anomaly 1: "I saved it and it disappeared"
+
+You update your profile bio. The write goes to the leader. Your page reloads, the read is load-balanced to a follower that hasn't caught up yet, and you see your *old* bio. To you, the save failed. You do it again. Now you're angry.
+
+**The guarantee that fixes it: read-your-own-writes** (a.k.a. read-after-write consistency). *You* always see *your own* writes. Everyone else may see stale data — that's fine, they don't know what you just typed.
+
+How to implement it (know at least two):
+- For anything the user could have modified, **read from the leader**. (E.g. always read your *own* profile from the leader, other people's from a follower.)
+- **Remember the write timestamp/position** (client-side or in the session). For the next N seconds after a write, route that user's reads to the leader, or to a follower that has caught up past that position.
+
+### Anomaly 2: "Time went backwards"
+
+You refresh a comment thread. The first read hits an up-to-date follower and shows a new comment. You refresh again; this read hits a *lagging* follower, and the comment **disappears**. Data appeared to travel backwards in time.
+
+**The guarantee that fixes it: monotonic reads.** You may see stale data, but you'll never see data get *older* than what you already saw.
+
+Implementation: make sure a given user always reads from the *same* replica (e.g. hash their user ID to pick one — and yes, that's consistent hashing from the previous post doing a completely different job). Caveat: if that replica dies you must reroute, and then you've broken the guarantee anyway.
+
+### Anomaly 3: "The answer came before the question"
+
+Two writes are causally related: Alice asks "how are you?", Bob replies "fine." A third observer reads from a replica that received Bob's reply but not yet Alice's question, and sees an answer to nothing.
+
+**The guarantee that fixes it: consistent prefix reads.** If writes happened in a certain causal order, anyone reading them sees them in that order. This one is mostly a *partitioned* problem — within one partition, order is preserved; across partitions, there's no global ordering unless you build one. (This is exactly why the odds feed partitions by `market_id`: it needs prices for *one market* ordered, and doesn't need — or want — a global order across all markets.)
+
+---
+
+## 3. Multi-leader replication
+
+What if writes could go to *more than one* leader? Now you can accept writes in multiple datacenters (fast local writes), or keep working offline (your phone's calendar app is effectively a leader).
+
+The price is unavoidable and severe: **two leaders can accept conflicting writes to the same record, and nobody notices until they sync.** In single-leader, that's impossible by construction. Here, it's the defining problem.
+
+**Conflict resolution strategies:**
+- **Last-write-wins (LWW).** Attach a timestamp; highest wins. Simple, extremely popular, and **it silently discards data** — and it depends on clocks from different machines being comparable, which they are not (see §5). Fine for a cache, terrible for a shopping cart.
+- **Conflict-free replicated data types (CRDTs).** Data structures designed so that concurrent changes *merge* deterministically with no conflict possible (counters, sets, sequences). This is how Google Docs–style collaborative editing works.
+- **Ask the application (or the user).** Store both versions and resolve on read — Amazon's shopping cart famously merged conflicting carts by taking the union, which meant deleted items could reappear. They judged that a better failure than losing an item.
+
+**Interview line:** *"Multi-leader buys you local writes and offline capability, and pays for it with conflicts. Only take that deal if you actually need one of those two things."*
+
+---
+
+## 4. Leaderless replication (Dynamo-style)
+
+Used by Cassandra, Riak, and Amazon's original Dynamo. **There is no leader.** The client (or a coordinator on its behalf) writes to *several* nodes at once and reads from *several* nodes at once.
+
+### Quorums — the actual mechanism
+
+Three numbers:
+- **N** = how many replicas hold each piece of data (e.g. 3)
+- **W** = how many must *acknowledge a write* before it counts as successful
+- **R** = how many must *respond to a read* before you accept the answer
+
+**The rule: if `W + R > N`, then any read set and any write set must overlap in at least one node** — so at least one node you read from is guaranteed to have the latest write. Since every value carries a version, you can tell which of the returned copies is newest and use it.
+
+Concretely, with N=3:
+- `W=3, R=1` — writes are slow and fragile (one node down blocks writes), reads are fast. Good for read-heavy, rarely-written data.
+- `W=1, R=3` — the mirror image.
+- **`W=2, R=2`** — 2+2 > 3 ✓. Tolerates *one* node being down for both reads and writes. This is the standard, balanced choice.
+- `W=1, R=1` — 1+1 = 2, not > 3 ✗. Fast, highly available, **and eventually consistent** — you can absolutely read stale data. Sometimes exactly what you want.
+
+The beauty of it: **consistency is a per-query dial, not a database-wide decision.** Cassandra lets you set it per statement. Read a user's session? `ONE`. Read their account balance? `QUORUM`.
+
+Two repair mechanisms make the stale nodes eventually catch up:
+- **Read repair** — when a read gets back different versions from different replicas, the coordinator writes the newest one back to the stale ones. Fixes frequently-read data for free.
+- **Anti-entropy** — a background process compares replicas (using Merkle trees, so it doesn't have to send everything) and fixes differences. Fixes data nobody reads.
+
+**Sloppy quorum & hinted handoff** (name-drop these): if the *right* N nodes for a key aren't reachable, write to *some other* N nodes temporarily so the write succeeds anyway; they hold the data as a "hint" and forward it home once the proper nodes return. Great for availability, and it means `W + R > N` no longer guarantees what you think it does — the overlapping node might not be one of the "home" nodes at all. This is why quorums are *not* the same as strong consistency.
+
+---
+
+## 4b. So which model, when?
+
+| | Writes go to | Conflicts possible? | Typical use |
+|---|---|---|---|
+| **Single-leader** | 1 node | No | Default. Postgres, MySQL, MongoDB, Kafka partitions |
+| **Multi-leader** | Several nodes | Yes — must resolve | Multi-datacenter writes, offline-capable clients |
+| **Leaderless** | Many nodes at once | Yes — versioned & repaired | High availability, tunable consistency. Cassandra, Dynamo |
+
+---
+
+## 5. Why "which write was later?" is a genuinely hard question
+
+Instinct says: timestamp the writes and take the newer one. This fails, and the reason is worth internalizing.
+
+**Physical clocks on different machines disagree.** NTP keeps them within tens of milliseconds — *usually*. Under network load, or on a VM whose clock drifts, skew can be hundreds of milliseconds or worse. Clocks can also jump *backwards* (an NTP correction). So "write A has timestamp 10:00:00.100 and B has 10:00:00.050, therefore A is later" can simply be false. Last-write-wins built on wall clocks quietly loses data. This is a real bug class, not a purist's complaint.
+
+**The fix: logical clocks — count events, don't read the wall.**
+
+- **Lamport timestamps**: a counter per node, exchanged with every message and set to `max(local, received) + 1`. Gives a total order consistent with causality — but you can't tell "concurrent" apart from "ordered."
+- **Version vectors**: one counter *per node*, all carried together. These *can* detect concurrency: if neither version vector dominates the other, the two writes were genuinely concurrent and there's a real conflict to resolve. This is what Dynamo-style systems use to decide whether they can auto-pick a winner or must hand you both versions ("siblings").
+- **Hybrid logical clocks (HLC)**: combine a physical timestamp with a logical counter, so you get something roughly human-readable *and* causally correct. Used by CockroachDB. (Spanner takes the other path: give every datacenter an atomic clock and a GPS receiver, bound the uncertainty explicitly, and *wait it out* — the famous `commit-wait`. Google can afford that; you can't.)
+
+**Interview line:** *"You can't order distributed events by wall-clock time. You need logical clocks — version vectors if you need to detect true concurrency."*
+
+---
+
+## 6. Consensus, briefly (and why you should mostly not build it)
+
+**Consensus** = getting a group of nodes to agree on one value, even when some are slow, crashed, or unreachable. Nearly every hard distributed problem reduces to it: *who is the leader?* *did this transaction commit?* *what's the current cluster membership?*
+
+**Raft** (and its ancestor Paxos) is the standard algorithm. The mental model is enough:
+- Nodes elect a leader by majority vote.
+- The leader appends entries to a replicated log; an entry is **committed** once a **majority** of nodes have it.
+- If the leader dies, a new election happens. Because commitment required a majority, and any two majorities overlap, the new leader is guaranteed to already have every committed entry. **Nothing committed can be lost.**
+
+**Why the majority matters:** a partitioned minority can never form a majority, so it can never elect a leader or commit anything. **That's what structurally prevents split-brain** — and it's why these systems need an odd number of nodes (3, 5) and can only tolerate `(n-1)/2` failures.
+
+**Fencing tokens** — the one detail worth memorizing. Every time a new leader is elected, it gets a monotonically increasing number. Every write it sends carries that number, and storage rejects any write carrying a number lower than the highest it has seen. Now, when a zombie old leader wakes up from its GC pause and tries to write, its stale token gets rejected. *Without fencing, a leader lease/lock does not actually protect you* — the old leader can still be mid-flight when the lease expires.
+
+**What to actually do:** don't implement consensus. Use something that already has: **etcd**, **ZooKeeper**, **Consul**, or the consensus built into your database (Kafka's KRaft, CockroachDB's Raft groups). Recognizing that a problem *needs* consensus, and reaching for the right tool, is the skill — not writing Raft.
+
+---
+
+## 7. CAP, PACELC, and the words people misuse
+
+You have all the pieces now, so this finally makes sense.
+
+**CAP theorem, stated properly:** in a distributed system, **when a network partition occurs**, you must choose between:
+- **Consistency (CP)**: refuse to serve requests you can't guarantee are correct. Reject the write, return an error. *Correct but unavailable.*
+- **Availability (AP)**: answer anyway, with possibly-stale data, and reconcile later. *Available but possibly wrong.*
+
+**The single most important correction to how CAP is usually taught: you do not "pick 2 of 3."** Partition tolerance is not optional — networks fail whether you consent or not. **A "CA system" is just a single-node database.** The real question is always: *when the network breaks, do you sacrifice correctness or availability?*
+
+**PACELC** is the better framing, because partitions are rare and you're still making trade-offs the other 99.9% of the time:
+
+> **If Partition** → choose **A**vailability or **C**onsistency; **Else** → choose **L**atency or **C**onsistency.
+
+That "else" clause is exactly the sync-vs-async replication trade-off from §1. Waiting for replicas costs latency; not waiting costs consistency. Every day, not just on bad days.
+
+- Cassandra / Dynamo: **PA/EL** (available under partition, low-latency otherwise — stale reads either way, unless you dial the quorum up)
+- HBase / Spanner: **PC/EC** (consistency over both availability and latency)
+- DynamoDB: **PA/EL** by default, **PC/EC** if you request strongly consistent reads
+
+**The vocabulary trap, and it *is* asked:** **the C in CAP is not the C in ACID.**
+- CAP's C = **linearizability**: the system behaves as if there were one single copy of the data and every operation happened instantaneously at one point in time. It's about *recency of reads across replicas.*
+- ACID's C = **consistency** as in "the database doesn't violate your constraints" (no negative balances, foreign keys hold). It's about *application invariants on one node.*
+
+They are unrelated ideas that unluckily share a letter.
+
+### The consistency ladder (strongest to weakest)
+
+| Model | The promise | Cost |
+|---|---|---|
+| **Linearizable / strong** | There is one copy. Every read sees the latest write. | Needs consensus; coordination on every op; unavailable under partition |
+| **Sequential** | Everyone sees operations in the same order — but maybe not instantly | Cheaper |
+| **Causal** | Causally-related events are seen in order; concurrent ones may differ per observer | **Available under partition — the strongest model that is.** Often the sweet spot |
+| **Eventual** | If writes stop, all replicas converge... eventually. Says nothing about *when*. | Cheapest, most available, most surprising |
+
+"Eventual consistency" is a famously weak promise — it doesn't tell you *how* stale, or bound it at all. Whenever you can, name a *specific* guarantee instead (read-your-own-writes, monotonic reads, causal). That's the vocabulary that shows you've thought about it.
+
+---
+
+## 8. Where this shows up in the odds feed
+
+- **Kafka is single-leader replication, per partition.** Each partition has one leader broker and followers; the **ISR** (in-sync replicas) is the set that has caught up. `acks=all` means "don't acknowledge my write until all in-sync replicas have it" — that's **synchronous replication**, and it's the right setting when a lost odds update means a client trades on a stale price. `acks=1` is async: faster, and it can lose writes when a broker dies. This is §1, verbatim.
+- **`min.insync.replicas`** is a quorum. Set it to 2 with replication factor 3 and you get: tolerate one broker failure, refuse writes if two are down. That's an explicit, deliberate **CP** choice — the system stops accepting data rather than accepting data it might lose.
+- **Consumer lag is replication lag** wearing a different hat: how far behind the head of the log a consumer is. If the WebSocket gateways lag, clients get stale prices — which is *precisely* the anomaly in §2, just at the application tier. This is why it's the alarm that matters.
+- **Ordering guarantee:** per-market ordering (consistent prefix reads, §2 anomaly 3) is required — a client must never see a price move backwards. Global ordering across markets is *not* required, and demanding it would kill scalability. Knowing which guarantee you need, and no more, is the whole game.
+- **Clock skew (§5) is a live problem here:** 300 bookmakers each stamp their own updates. Their clocks disagree. "Which price is newer?" cannot be answered by comparing their timestamps — you need your *own* ingest sequence, per market, which is exactly what the Kafka partition offset gives you.
+
+---
+
+## 9. The interview checklist
+
+1. **Replication or partitioning?** Be explicit: same data on many nodes (replication) vs different data on many nodes (partitioning). Most systems need both.
+2. **Why are you replicating?** Availability, read throughput, or geographic latency. They lead to different designs.
+3. **Which model?** Single-leader by default. Justify multi-leader (multi-DC writes / offline) or leaderless (max availability, tunable) if you go there.
+4. **Sync or async?** Name the trade: async can lose acknowledged writes on failover; sync blocks on a slow replica. Semi-sync is the usual compromise.
+5. **What happens when the leader dies?** Detection (timeouts), election, and the three hazards: lost writes, split-brain, bad timeouts.
+6. **How do you prevent split-brain?** Majority quorum + **fencing tokens**. Say both.
+7. **What staleness anomalies can users hit?** Read-your-own-writes, monotonic reads, consistent prefix. Give the user-visible symptom, then the fix.
+8. **If leaderless: what are N, W, R?** State them, and state that `W+R > N` gives overlap. `N=3, W=2, R=2` is the default answer.
+9. **How do you order concurrent writes?** *Not* wall clocks. Logical clocks / version vectors.
+10. **CAP:** frame it as "under partition, do I sacrifice consistency or availability?" — never as "pick 2 of 3." Then upgrade to PACELC.
+
+### Quickfire answers
+
+**"Replication vs partitioning?"** Replication = copies of the *same* data on several nodes (availability, read scale). Partitioning = *different* data on different nodes (storage and write scale). Orthogonal; used together.
+
+**"What's replication lag?"** The window between the leader accepting a write and a follower applying it. During it, that follower serves stale reads and doesn't tell you.
+
+**"What's wrong with async replication?"** Writes you already acknowledged to the client can be lost if the leader dies before they propagate.
+
+**"What's split-brain, and how do you prevent it?"** Two nodes both believe they're the leader and both accept writes; the data diverges irreconcilably. Prevent with majority quorums (a partitioned minority can't elect a leader) plus fencing tokens (storage rejects writes from a stale leader).
+
+**"What does `W + R > N` guarantee?"** That the read set and write set overlap in at least one node, so a read sees at least one copy of the latest write. Caveat: sloppy quorums break this.
+
+**"A user saves their profile and sees the old one. What's the bug and the fix?"** Read hit a lagging follower — you're missing read-your-own-writes. Route that user's reads to the leader for a short window after a write.
+
+**"Can you order events by timestamp?"** No — clocks on different machines disagree and can jump backwards. Use logical clocks; version vectors if you need to detect true concurrency.
+
+**"CAP — pick two?"** No. Partitions aren't optional. Under partition you choose C or A; the rest of the time you're trading latency against consistency (PACELC).
+
+**"Is the C in CAP the C in ACID?"** No. CAP's C is linearizability (reads see the latest write across replicas). ACID's C is "constraints aren't violated." Same letter, unrelated concepts.
+
+**"What's the strongest consistency model you can have while staying available under a partition?"** Causal consistency.
+
+---
+
+## 10. Further reading
+
+- **DDIA, Chapters 5 and 9** — replication, and then "Consistency and Consensus." Ch. 9 is the hardest chapter in the book and the highest-value one for interviews.
+- **Raft paper / raft.github.io** — the visualization there teaches leader election in about ten minutes. Far more approachable than Paxos.
+- **Dynamo (2007)** — quorums, sloppy quorums, hinted handoff, version vectors, all in one readable paper.
+- **Kyle Kingsbury's "Jepsen" write-ups** — real databases, tested against real partitions, breaking in ways their docs said they wouldn't. Sobering and genuinely fun.
