@@ -16,7 +16,7 @@
 
 7 - [Caching](#caching)
 
-8 - [Replication & Consistency Models](#replcation)
+8 - [Replication & Consistency Models](#replication)
 
 
 # Practical cases or blog posts
