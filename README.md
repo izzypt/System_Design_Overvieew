@@ -18,6 +18,8 @@
 
 8 - [Replication & Consistency Models](#replication)
 
+9 - [SOLID, KISS , ACID...](#solid,kiss)
+
 
 # Practical cases or blog posts
 
@@ -1542,3 +1544,100 @@ They are unrelated ideas that unluckily share a letter.
 - **Raft paper / raft.github.io** — the visualization there teaches leader election in about ten minutes. Far more approachable than Paxos.
 - **Dynamo (2007)** — quorums, sloppy quorums, hinted handoff, version vectors, all in one readable paper.
 - **Kyle Kingsbury's "Jepsen" write-ups** — real databases, tested against real partitions, breaking in ways their docs said they wouldn't. Sobering and genuinely fun.
+
+
+
+<a name="solid,kiss"><a/>
+# 1 - SOLID, KISS, ACID....
+
+Software design principles and database properties are like the unwritten rules of good engineering. They keep your code from turning into a chaotic, unmaintainable mess and ensure your application doesn't drop data when millions of users hit it at once.
+
+Here is a breakdown of the big ones—**SOLID**, **KISS**, **DRY**, and **ACID**—and how they actually show up in a software engineer’s daily routine.
+
+---
+
+## 1. SOLID Principles
+
+SOLID is an acronym for five object-oriented design principles aimed at making code readable, flexible, and easy to maintain.
+
+### **S — Single Responsibility Principle (SRP)**
+
+> *A class or module should have one, and only one, reason to change.*
+
+* **What it means:** Each piece of code should do **one job**.
+* **Day-to-day application:** When building a user sign-up feature, you don't put database logic, email sending, and password validation all in one giant `UserController` class. Instead, you create a `UserService`, an `EmailService`, and a `Validator`. If the email provider changes later, you only touch the `EmailService`.
+
+### **O — Open/Closed Principle (OCP)**
+
+> *Software entities should be open for extension, but closed for modification.*
+
+* **What it means:** You should be able to add new functionality without rewriting existing, tested code.
+* **Day-to-day application:** Imagine processing payments. Instead of using a giant `if/else` statement checking for `CreditCard`, `PayPal`, or `Crypto`, you define a payment interface. When marketing decides to add `Apple Pay`, you simply create a new `ApplePayProcessor` class without modifying the existing payment engine.
+
+### **L — Liskov Substitution Principle (LSP)**
+
+> *Subtypes must be substitutable for their base types.*
+
+* **What it means:** If code expects a parent class, passing in a child class shouldn't break the application.
+* **Day-to-day application:** If you have a base class called `Bird` with a `fly()` method, you shouldn't create a `Penguin` subclass that throws a `CannotFlyException`. In daily code reviews, engineers catch this by ensuring subclasses don't unexpectedly override or break base behaviors.
+
+### **I — Interface Segregation Principle (ISP)**
+
+> *Clients shouldn't be forced to depend on interfaces they do not use.*
+
+* **What it means:** Keep interfaces small and specific rather than large and multi-purpose.
+* **Day-to-day application:** Instead of creating a massive `Worker` interface with methods like `code()`, `design()`, and `manage()`, split them into `Codable`, `Designable`, and `Manageable`. A backend developer class only implements `Codable`, so it isn't forced to write empty methods for `design()`.
+
+### **D — Dependency Inversion Principle (DIP)**
+
+> *Depend upon abstractions, not concretions.*
+
+* **What it means:** High-level code shouldn't rely directly on low-level details. Both should rely on shared interfaces.
+* **Day-to-day application:** When writing unit tests, you don't want your test code hitting a live SQL database. By using DIP, your core app depends on a generic `DatabaseRepository` interface. In production, you inject a `PostgreSQLRepository`; in tests, you inject a `MockRepository`.
+
+---
+
+## 2. General Engineering Principles
+
+### **KISS — Keep It Simple, Stupid**
+
+* **What it means:** Avoid over-engineering. The simplest solution is usually the best one.
+* **Day-to-day application:** You need to filter a list of 100 items. Instead of implementing a complex, custom thread-pooling search algorithm because it looks cool, you use standard library methods (like `.filter()`). During code reviews, engineers frequently ask, *"Can we make this simpler?"*
+
+### **DRY — Don't Repeat Yourself**
+
+* **What it means:** Every piece of knowledge or logic must have a single, unambiguous representation in a system.
+* **Day-to-day application:** If you find yourself copying and pasting a 10-line date-formatting function into three different UI components, stop. Move that logic into a single helper function (`formatDate()`) and import it. If the date format requirement changes, you update it in one place instead of hunting down three copies.
+
+---
+
+## 3. ACID Properties (Database Reliability)
+
+Unlike SOLID, KISS, and DRY (which govern code design), **ACID** governs **database transactions** to ensure data integrity.
+
+### **A — Atomicity ("All or Nothing")**
+
+* **Application:** Transferring $50 from User A to User B requires two steps: deducting $50 from A, and adding $50 to B. If step two fails, Atomicity rolls back step one so User A doesn't lose money into thin air.
+
+### **C — Consistency**
+
+* **Application:** Your database has rules (e.g., balance cannot be negative). A transaction will only succeed if the end state respects all database constraints, foreign keys, and rules.
+
+### **I — Isolation**
+
+* **Application:** If two users try to buy the very last seat on a flight at the exact same millisecond, Isolation ensures the transactions run independently so the seat isn't double-booked.
+
+### **D — Durability**
+
+* **Application:** Once a transaction is committed (e.g., "Payment Successful"), that state is permanently saved to storage. Even if the server loses power a microsecond later, the transaction remains intact when power returns.
+
+---
+
+## How They Fit Together Daily
+
+When a software engineer gets a ticket to build a new feature:
+
+1. They apply **KISS** to keep the initial solution straightforward.
+2. They structure their classes using **SOLID** so the code is clean and easy to test.
+3. They extract reusable utilities to stay **DRY**.
+4. They wrap critical database interactions in an **ACID** transaction so user data stays safe.
